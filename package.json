@@ -1,8 +1,8 @@
 {
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
-  "description": "Manage and switch AI coding assistant providers, starting with Claude Code gateways and official subscriptions.",
-  "version": "0.1.1",
+  "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
+  "version": "0.2.0",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -23,6 +23,8 @@
     "claude",
     "claude-code",
     "anthropic",
+    "codex",
+    "openai",
     "gateway",
     "provider",
     "switcher",
@@ -81,6 +83,42 @@
       {
         "command": "aiProviderSwitcher.showModels",
         "title": "AI Provider Switcher: Show Claude Gateway Models"
+      },
+      {
+        "command": "aiProviderSwitcher.switchCodexProvider",
+        "title": "AI Provider Switcher: Switch Codex Provider"
+      },
+      {
+        "command": "aiProviderSwitcher.useCodexOfficial",
+        "title": "AI Provider Switcher: Use Codex Official Provider"
+      },
+      {
+        "command": "aiProviderSwitcher.manageCodexProviders",
+        "title": "AI Provider Switcher: Manage Codex Providers"
+      },
+      {
+        "command": "aiProviderSwitcher.addCodexProvider",
+        "title": "AI Provider Switcher: Add Codex Provider"
+      },
+      {
+        "command": "aiProviderSwitcher.removeCodexProvider",
+        "title": "AI Provider Switcher: Remove Codex Provider"
+      },
+      {
+        "command": "aiProviderSwitcher.clearCodexApiKey",
+        "title": "AI Provider Switcher: Clear Codex API Key"
+      },
+      {
+        "command": "aiProviderSwitcher.refreshCodexModels",
+        "title": "AI Provider Switcher: Refresh Codex Models"
+      },
+      {
+        "command": "aiProviderSwitcher.showCodexModels",
+        "title": "AI Provider Switcher: Show Codex Models"
+      },
+      {
+        "command": "aiProviderSwitcher.selectCodexModel",
+        "title": "AI Provider Switcher: Select Codex Model"
       }
     ],
     "configuration": {
@@ -162,6 +200,78 @@
             }
           },
           "default": []
+        },
+        "aiProviderSwitcher.codexDefaultModel": {
+          "type": "string",
+          "default": "gpt-5.6-sol",
+          "description": "Default Codex model used before a provider's model list is refreshed."
+        },
+        "aiProviderSwitcher.codexProviders": {
+          "type": "array",
+          "description": "Named OpenAI Responses API-compatible Codex providers. API keys are stored separately in VS Code Secret Storage and an encrypted local helper file.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "baseUrl"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "baseUrl": {
+                "type": "string"
+              }
+            }
+          },
+          "default": [
+            {
+              "id": "pateway",
+              "name": "Pateway",
+              "baseUrl": "https://api.pateway.ai"
+            }
+          ]
+        },
+        "aiProviderSwitcher.codexModels": {
+          "type": "array",
+          "description": "Models last returned by each Codex provider's /v1/models endpoint.",
+          "items": {
+            "type": "object",
+            "required": [
+              "providerId",
+              "models",
+              "updatedAt"
+            ],
+            "properties": {
+              "providerId": {
+                "type": "string"
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "updatedAt": {
+                "type": "string"
+              }
+            }
+          },
+          "default": []
+        },
+        "aiProviderSwitcher.codexActiveProviderId": {
+          "type": "string",
+          "default": "",
+          "description": "Currently selected Codex provider ID."
+        },
+        "aiProviderSwitcher.codexActiveModel": {
+          "type": "string",
+          "default": "",
+          "description": "Currently selected Codex model."
         }
       }
     }
@@ -169,7 +279,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test test/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",
