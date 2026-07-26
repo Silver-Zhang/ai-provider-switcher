@@ -12,6 +12,7 @@
     "url": "https://github.com/Silver-Zhang/ai-provider-switcher/issues"
   },
   "homepage": "https://github.com/Silver-Zhang/ai-provider-switcher#readme",
+  "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.90.0"
   },
