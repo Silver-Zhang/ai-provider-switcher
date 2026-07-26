@@ -2,6 +2,10 @@
 
 All notable changes to AI Provider Switcher are documented in this file.
 
+## 0.1.1 - 2026-07-26
+
+- Added the Marketplace extension icon.
+
 ## 0.1.0 - 2026-07-26
 
 - Added switching between Claude official subscription and gateway mode.
