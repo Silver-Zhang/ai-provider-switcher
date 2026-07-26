@@ -1,0 +1,165 @@
+{
+  "name": "ai-provider-switcher",
+  "displayName": "AI Provider Switcher",
+  "description": "Manage and switch AI coding assistant providers, starting with Claude Code gateways and official subscriptions.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Silver-Zhang/ai-provider-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Silver-Zhang/ai-provider-switcher/issues"
+  },
+  "homepage": "https://github.com/Silver-Zhang/ai-provider-switcher#readme",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:aiProviderSwitcher.switchMode",
+    "onCommand:aiProviderSwitcher.useOfficial",
+    "onCommand:aiProviderSwitcher.useGateway"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "aiProviderSwitcher.switchMode",
+        "title": "AI Provider Switcher: Quick Switch Claude Mode"
+      },
+      {
+        "command": "aiProviderSwitcher.useOfficial",
+        "title": "AI Provider Switcher: Use Claude Official Subscription"
+      },
+      {
+        "command": "aiProviderSwitcher.useGateway",
+        "title": "AI Provider Switcher: Use Claude Gateway"
+      },
+      {
+        "command": "aiProviderSwitcher.manageGateways",
+        "title": "AI Provider Switcher: Manage Claude Gateways"
+      },
+      {
+        "command": "aiProviderSwitcher.addGateway",
+        "title": "AI Provider Switcher: Add Claude Gateway"
+      },
+      {
+        "command": "aiProviderSwitcher.removeGateway",
+        "title": "AI Provider Switcher: Remove Claude Gateway"
+      },
+      {
+        "command": "aiProviderSwitcher.clearGatewayToken",
+        "title": "AI Provider Switcher: Clear Saved Claude Gateway Token"
+      },
+      {
+        "command": "aiProviderSwitcher.openSessionHistory",
+        "title": "AI Provider Switcher: Open Claude Session History"
+      },
+      {
+        "command": "aiProviderSwitcher.refreshModels",
+        "title": "AI Provider Switcher: Refresh Claude Gateway Models"
+      },
+      {
+        "command": "aiProviderSwitcher.showModels",
+        "title": "AI Provider Switcher: Show Claude Gateway Models"
+      }
+    ],
+    "configuration": {
+      "title": "AI Provider Switcher",
+      "properties": {
+        "aiProviderSwitcher.gatewayBaseUrl": {
+          "type": "string",
+          "default": "https://api-sub2api.reallab.eu.cc",
+          "description": "Gateway base URL used for Claude Code (ANTHROPIC_BASE_URL)."
+        },
+        "aiProviderSwitcher.enableGatewayDiscovery": {
+          "type": "boolean",
+          "default": true,
+          "description": "Set CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 when switching to Gateway mode."
+        },
+        "aiProviderSwitcher.disableLoginPromptInGateway": {
+          "type": "boolean",
+          "default": true,
+          "description": "Set claudeCode.disableLoginPrompt=true when switching to Gateway mode."
+        },
+        "aiProviderSwitcher.setAttributionHeaderZero": {
+          "type": "boolean",
+          "default": true,
+          "description": "Set CLAUDE_CODE_ATTRIBUTION_HEADER=0 when switching to Gateway mode."
+        },
+        "aiProviderSwitcher.gateways": {
+          "type": "array",
+          "description": "Named Claude gateway profiles. Tokens are stored separately in VS Code Secret Storage.",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "baseUrl"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "baseUrl": {
+                "type": "string"
+              }
+            }
+          },
+          "default": [
+            {
+              "id": "reallab",
+              "name": "RealLab Gateway",
+              "baseUrl": "https://api-sub2api.reallab.eu.cc"
+            }
+          ]
+        },
+        "aiProviderSwitcher.gatewayModels": {
+          "type": "array",
+          "description": "Models last returned by each gateway's /v1/models endpoint. This is informational; Claude Code controls its own model picker.",
+          "items": {
+            "type": "object",
+            "required": [
+              "gatewayId",
+              "models",
+              "updatedAt"
+            ],
+            "properties": {
+              "gatewayId": {
+                "type": "string"
+              },
+              "models": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "updatedAt": {
+                "type": "string"
+              }
+            }
+          },
+          "default": []
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.12",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.5.4"
+  }
+}
