@@ -2,6 +2,12 @@
 
 All notable changes to AI Provider Switcher are documented in this file.
 
+## 0.3.1 - 2026-07-27
+
+- Changed Codex custom-service setup to synchronize discovered models into Codex's native model picker.
+- Removed model selection from the Codex Provider switch flow.
+- Added an Open Codex action so models are selected from the Codex page after reloading.
+
 ## 0.3.0 - 2026-07-27
 
 - Added a unified visual manager for Claude and Codex services and models.

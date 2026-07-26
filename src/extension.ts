@@ -8,6 +8,7 @@ import { URL } from "node:url";
 import {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
+  createCodexModelCatalog,
   getCodexApiBaseUrl,
   normalizeProviderRootUrl,
   parseTopLevelTomlString,
@@ -42,6 +43,7 @@ const CODEX_MODELS_KEY = "codexModels";
 const CODEX_ACTIVE_PROVIDER_KEY = "codexActiveProviderId";
 const CODEX_ACTIVE_MODEL_KEY = "codexActiveModel";
 const CODEX_CONFIG_FILE = path.join(os.homedir(), ".codex", "config.toml");
+const CODEX_MODEL_CATALOG_FILE = path.join(os.homedir(), ".codex", "ai-provider-switcher-models.json");
 const CODEX_BACKUP_KEY = "codex.originalTopLevelConfig";
 
 const MANAGED_ENV_KEYS = new Set([
@@ -91,10 +93,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("aiProviderSwitcher.refreshCodexModels", () =>
       refreshCodexModels(context)
     ),
-    vscode.commands.registerCommand("aiProviderSwitcher.showCodexModels", () => showCodexModels()),
-    vscode.commands.registerCommand("aiProviderSwitcher.selectCodexModel", () =>
-      selectCodexModel(context)
-    )
+    vscode.commands.registerCommand("aiProviderSwitcher.showCodexModels", () => showCodexModels())
   );
 
   context.subscriptions.push(
@@ -218,7 +217,7 @@ async function handleProviderManagerAction(
   if (action === "codexOfficial") await switchToCodexOfficial(context);
   if (action === "manageCodex") await manageCodexProviders(context);
   if (action === "refreshCodex") await refreshCodexModels(context);
-  if (action === "selectCodexModel") await selectCodexModel(context);
+  if (action === "openCodex") await vscode.commands.executeCommand("chatgpt.openSidebar");
 }
 
 function getCurrentMode(): ProviderMode {
@@ -573,20 +572,12 @@ async function switchToCodexGateway(context: vscode.ExtensionContext): Promise<v
     if (models.length === 0) {
       throw new Error("该 Provider 没有返回可用模型");
     }
-    const currentModel = settings.get<string>(CODEX_ACTIVE_MODEL_KEY, "");
-    const configuredDefault = settings.get<string>("codexDefaultModel", "");
-    const model = models.includes(currentModel)
-      ? currentModel
-      : models.includes(configuredDefault)
-        ? configuredDefault
-        : models[0];
-
-    await writeCodexConfiguration(context, provider, model);
+    await writeCodexConfiguration(context, provider, models);
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, provider.id, vscode.ConfigurationTarget.Global);
-    await settings.update(CODEX_ACTIVE_MODEL_KEY, model, vscode.ConfigurationTarget.Global);
+    await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
     await refreshStatusBar();
     await offerReload(
-      `Codex 已切换到“${provider.name}”。已发现 ${models.length} 个模型，当前默认使用 ${model}；可稍后在管理界面更换。是否立即重载？`
+      `Codex 已切换到“${provider.name}”。已同步 ${models.length} 个模型；重载后请直接在 Codex 页面原生模型栏中选择。是否立即重载？`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
@@ -611,7 +602,12 @@ async function switchToCodexOfficial(context: vscode.ExtensionContext): Promise<
       "model",
       backup?.hadModel ? backup.model : undefined
     );
-    await writeCodexConfigurationFile(restored);
+    const restoredCatalog = updateTopLevelTomlKey(
+      restored,
+      "model_catalog_json",
+      backup?.hadModelCatalog ? backup.modelCatalog : undefined
+    );
+    await writeCodexConfigurationFile(restoredCatalog);
 
     const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, "", vscode.ConfigurationTarget.Global);
@@ -631,8 +627,8 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
       { label: "添加 Codex 中转站", action: "add" },
       { label: "删除 Codex 中转站", action: "remove" },
       { label: "清除某个 Codex API Key", action: "clear" },
-      { label: "刷新 Codex 模型", action: "refresh" },
-      { label: "选择 Codex 模型", action: "model" },
+      { label: "刷新并同步 Codex 模型", action: "refresh" },
+      { label: "打开 Codex 页面选择模型", action: "open" },
       { label: "查看 Codex 模型", action: "show" }
     ],
     { title: "管理 Codex Provider" }
@@ -645,7 +641,7 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
   if (action.action === "remove") await removeCodexProvider(context);
   if (action.action === "clear") await clearCodexApiKey(context);
   if (action.action === "refresh") await refreshCodexModels(context);
-  if (action.action === "model") await selectCodexModel(context);
+  if (action.action === "open") await vscode.commands.executeCommand("chatgpt.openSidebar");
   if (action.action === "show") await showCodexModels();
 }
 
@@ -792,46 +788,21 @@ async function refreshCodexModels(context: vscode.ExtensionContext): Promise<voi
   try {
     const models = await requestCodexModels(provider.baseUrl, apiKey);
     await saveCodexModels(provider.id, models);
+    const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+    const activeProviderId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+    if (activeProviderId === provider.id) {
+      await writeCodexConfiguration(context, provider, models);
+      await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
+    }
     const choice = await vscode.window.showInformationMessage(
-      `已从“${provider.name}”刷新 ${models.length} 个 Codex 模型。`,
-      "查看模型",
+      `已从“${provider.name}”刷新 ${models.length} 个 Codex 模型${activeProviderId === provider.id ? "，并同步到 Codex 原生模型栏；重载后生效" : ""}。`,
+      "打开 Codex",
       "关闭"
     );
-    if (choice === "查看模型") await showCodexModels(provider.id);
+    if (choice === "打开 Codex") await vscode.commands.executeCommand("chatgpt.openSidebar");
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知网络错误";
     vscode.window.showErrorMessage(`刷新“${provider.name}”的 Codex 模型失败：${message}`);
-  }
-}
-
-async function selectCodexModel(context: vscode.ExtensionContext): Promise<void> {
-  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
-  const activeId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
-  if (!activeId) {
-    vscode.window.showInformationMessage("当前是 Codex 官方 Provider。请先切换到 Codex 中转站。 ");
-    return;
-  }
-
-  const provider = getCodexProviders().find((item) => item.id === activeId);
-  const models = getCodexModels().find((entry) => entry.providerId === activeId)?.models ?? [];
-  if (!provider || models.length === 0) {
-    vscode.window.showInformationMessage("还没有缓存模型，请先执行 AI Provider Switcher: Refresh Codex Models。");
-    return;
-  }
-
-  const selected = await vscode.window.showQuickPick(
-    models.map((model) => ({ label: model, model })),
-    { title: `选择 ${provider.name} 的 Codex 模型` }
-  );
-  if (!selected) return;
-
-  try {
-    await writeCodexConfiguration(context, provider, selected.model);
-    await settings.update(CODEX_ACTIVE_MODEL_KEY, selected.model, vscode.ConfigurationTarget.Global);
-    await offerReload(`Codex 模型已切换为 ${selected.model}。是否立即重载 VS Code？`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "未知错误";
-    vscode.window.showErrorMessage(`切换 Codex 模型失败：${message}`);
   }
 }
 
@@ -939,12 +910,15 @@ type CodexSelectionBackup = {
   model?: string;
   hadModelProvider: boolean;
   modelProvider?: string;
+  hadModelCatalog: boolean;
+  modelCatalog?: string;
 };
 
 async function writeCodexConfiguration(
   context: vscode.ExtensionContext,
   provider: CodexProviderProfile,
-  model: string
+  models: string[],
+  selectedModel?: string
 ): Promise<void> {
   const content = await readCodexConfiguration();
   if (!context.globalState.get<CodexSelectionBackup>(CODEX_BACKUP_KEY)) {
@@ -952,17 +926,30 @@ async function writeCodexConfiguration(
       hadModel: parseTopLevelTomlString(content, "model") !== undefined,
       model: parseTopLevelTomlString(content, "model"),
       hadModelProvider: parseTopLevelTomlString(content, "model_provider") !== undefined,
-      modelProvider: parseTopLevelTomlString(content, "model_provider")
+      modelProvider: parseTopLevelTomlString(content, "model_provider"),
+      hadModelCatalog: parseTopLevelTomlString(content, "model_catalog_json") !== undefined,
+      modelCatalog: parseTopLevelTomlString(content, "model_catalog_json")
     } satisfies CodexSelectionBackup);
   }
 
   await ensureCodexAuthHelper();
+  await writeCodexModelCatalog(models);
   const providers = getCodexProviders();
   let updated = removeManagedCodexProviders(content);
   updated = updateTopLevelTomlKey(updated, "model_provider", provider.id);
-  updated = updateTopLevelTomlKey(updated, "model", model);
+  updated = updateTopLevelTomlKey(updated, "model_catalog_json", CODEX_MODEL_CATALOG_FILE);
+  updated = updateTopLevelTomlKey(updated, "model", selectedModel);
   updated = `${updated.trimEnd()}\n\n${serializeManagedCodexProviders(providers)}\n`;
   await writeCodexConfigurationFile(updated);
+}
+
+async function writeCodexModelCatalog(models: string[]): Promise<void> {
+  await fs.mkdir(path.dirname(CODEX_MODEL_CATALOG_FILE), { recursive: true });
+  await fs.writeFile(
+    CODEX_MODEL_CATALOG_FILE,
+    `${JSON.stringify(createCodexModelCatalog(models), null, 2)}\n`,
+    "utf8"
+  );
 }
 
 async function readCodexConfiguration(): Promise<string> {

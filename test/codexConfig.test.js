@@ -3,6 +3,7 @@ const test = require("node:test");
 const {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
+  createCodexModelCatalog,
   getCodexApiBaseUrl,
   normalizeProviderRootUrl,
   parseTopLevelTomlString,
@@ -60,4 +61,12 @@ test("removes a missing original top-level key during restore", () => {
   assert.equal(parseTopLevelTomlString(restored, "model_provider"), undefined);
   assert.equal(parseTopLevelTomlString(restored, "model"), undefined);
   assert.match(restored, /\[features\]/);
+});
+
+test("creates a Codex-native model catalog for the picker", () => {
+  const catalog = createCodexModelCatalog(["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-sol"]);
+  assert.equal(catalog.models.length, 2);
+  assert.equal(catalog.models[0].slug, "gpt-5.6-sol");
+  assert.equal(catalog.models[0].visibility, "list");
+  assert.equal(catalog.models[0].supported_in_api, true);
 });

@@ -8,7 +8,7 @@ export type ProviderManagerAction =
   | "codexOfficial"
   | "manageCodex"
   | "refreshCodex"
-  | "selectCodexModel";
+  | "openCodex";
 
 export type ProviderManagerState = {
   claudeMode: string;
@@ -100,11 +100,11 @@ export class ProviderManagerPanel {
       ${providerCard("Claude", state.claudeMode, "", state.claudeProviders.map((item) => ({ ...item, count: "" })), [
         ["快速切换", "switchClaude", false], ["管理服务", "manageClaude", true], ["刷新模型", "refreshClaude", true]
       ])}
-      ${providerCard("Codex", state.codexMode, state.codexModel ? `当前模型：${escapeHtml(state.codexModel)}` : "", state.codexProviders.map((item) => ({ ...item, count: `${item.modelCount} 个模型` })), [
-        ["切换服务", "switchCodex", false], ["使用官方", "codexOfficial", true], ["管理服务", "manageCodex", true], ["刷新模型", "refreshCodex", true], ["选择模型", "selectCodexModel", true]
+      ${providerCard("Codex", state.codexMode, "模型请在 Codex 页面原生模型栏中选择", state.codexProviders.map((item) => ({ ...item, count: `${item.modelCount} 个模型` })), [
+        ["切换服务", "switchCodex", false], ["打开 Codex 选择模型", "openCodex", false], ["使用官方", "codexOfficial", true], ["管理服务", "manageCodex", true], ["刷新模型", "refreshCodex", true]
       ])}
     </section>
-    <div class="note">URL 只填写服务根地址，例如 https://api.example.com。Claude 与 Codex 所需的 /v1 路径由插件按协议自动补全。API Key 不在此页面回显。</div>
+    <div class="note">URL 只填写服务根地址，例如 https://api.example.com。Claude 与 Codex 所需的 /v1 路径由插件按协议自动补全。Codex Provider 启用后，模型会同步到 Codex 页面自身的模型栏中选择。API Key 不在此页面回显。</div>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();

@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -119,10 +119,6 @@
       {
         "command": "aiProviderSwitcher.showCodexModels",
         "title": "AI Provider Switcher: Show Codex Models"
-      },
-      {
-        "command": "aiProviderSwitcher.selectCodexModel",
-        "title": "AI Provider Switcher: Select Codex Model"
       }
     ],
     "configuration": {
@@ -204,11 +200,6 @@
             }
           },
           "default": []
-        },
-        "aiProviderSwitcher.codexDefaultModel": {
-          "type": "string",
-          "default": "gpt-5.6-sol",
-          "description": "Default Codex model used before a provider's model list is refreshed."
         },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",

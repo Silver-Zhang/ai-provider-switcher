@@ -17,6 +17,7 @@ For the official OpenAI Codex IDE extension, it can also:
 - Maintain multiple Codex gateway profiles
 - Discover model IDs from `/v1/models`
 - Select the active Codex model
+- Synchronize discovered custom-provider models into Codex's native model picker
 - Update the shared user-level `%USERPROFILE%\.codex\config.toml`
 - Keep each Codex API key out of VS Code settings by using Secret Storage plus a
 	Windows DPAPI-encrypted helper file under `%USERPROFILE%\.codex`
@@ -40,7 +41,7 @@ For the official OpenAI Codex IDE extension, it can also:
 - Command: AI Provider Switcher: Use Codex Official Provider
 - Command: AI Provider Switcher: Manage Codex Providers
 - Command: AI Provider Switcher: Refresh Codex Models
-- Command: AI Provider Switcher: Select Codex Model
+- Model selection is performed in Codex's native model control after provider synchronization
 - Command: AI Provider Switcher: Show Codex Models
 - Status bar indicator: Claude: Official or Claude: Gateway
 - Gateway token is cached in VS Code Secret Storage, but Claude Code's required
@@ -92,6 +93,10 @@ only the provider root, such as `https://api.example.com`; the extension derives
 the protocol path `/v1` internally. The extension writes only provider metadata and the
 selected model to `%USERPROFILE%\.codex\config.toml`; API keys are not written
 in plaintext there.
+
+Switching a Codex provider does not ask you to choose a model. The extension
+discovers `/v1/models`, writes a Codex-compatible local model catalog, and then
+you select the model from the Codex page's own model control after reloading.
 
 When switching Codex to a custom service, the extension calls `/v1/models`
 automatically. It reuses the current model when available, otherwise uses the
