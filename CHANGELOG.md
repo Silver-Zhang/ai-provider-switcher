@@ -2,6 +2,11 @@
 
 All notable changes to AI Provider Switcher are documented in this file.
 
+## 0.3.2 - 2026-07-27
+
+- Fixed Windows DPAPI authentication helper failures caused by trailing newlines in encrypted key files.
+- Restored the Codex Authorization header for custom providers, resolving `401 Missing API Key` responses.
+
 ## 0.3.1 - 2026-07-27
 
 - Changed Codex custom-service setup to synchronize discovered models into Codex's native model picker.

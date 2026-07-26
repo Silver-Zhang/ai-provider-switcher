@@ -994,7 +994,7 @@ async function ensureCodexAuthHelper(): Promise<void> {
   await fs.mkdir(path.dirname(CODEX_AUTH_HELPER_FILE), { recursive: true });
   const helper = [
     "$ErrorActionPreference = 'Stop'",
-    "$encrypted = Get-Content -Raw -LiteralPath $args[0]",
+    "$encrypted = (Get-Content -Raw -LiteralPath $args[0]).Trim()",
     "$secure = ConvertTo-SecureString -String $encrypted",
     "$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)",
     "try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) }",

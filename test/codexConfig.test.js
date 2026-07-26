@@ -70,3 +70,11 @@ test("creates a Codex-native model catalog for the picker", () => {
   assert.equal(catalog.models[0].visibility, "list");
   assert.equal(catalog.models[0].supported_in_api, true);
 });
+
+test("documents trimming encrypted key files before DPAPI decryption", () => {
+  const extensionSource = require("node:fs").readFileSync(
+    require("node:path").join(__dirname, "..", "src", "extension.ts"),
+    "utf8"
+  );
+  assert.match(extensionSource, /Get-Content -Raw -LiteralPath \$args\[0\]\)\.Trim\(\)/);
+});
