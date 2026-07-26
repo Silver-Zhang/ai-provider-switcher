@@ -2,6 +2,15 @@
 
 All notable changes to AI Provider Switcher are documented in this file.
 
+## 0.3.0 - 2026-07-27
+
+- Added a unified visual manager for Claude and Codex services and models.
+- Changed the status bar entry to open the unified manager.
+- Expanded Quick Switch to include Claude, Codex, and the manager.
+- Unified terminology around official and custom services.
+- Changed URL input to accept provider roots only and derive `/v1` protocol paths automatically.
+- Changed Codex switching to discover models automatically without forcing a model choice first.
+
 ## 0.2.0 - 2026-07-27
 
 - Added official OpenAI Codex provider and custom gateway switching.

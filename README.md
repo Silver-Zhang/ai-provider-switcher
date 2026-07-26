@@ -23,7 +23,10 @@ For the official OpenAI Codex IDE extension, it can also:
 
 ## Features
 
-- Command: Claude Switcher: Quick Switch Mode
+- Visual Provider Manager for Claude and Codex
+- Unified status bar entry for all providers
+- Command: AI Provider Switcher: Quick Switch Provider
+- Command: AI Provider Switcher: Open Provider Manager
 - Command: Claude Switcher: Use Official Subscription
 - Command: Claude Switcher: Use Gateway
 - Command: Claude Switcher: Manage Gateways
@@ -84,10 +87,16 @@ can display them with `Claude Switcher: Show Gateway Models`.
 
 Configure Codex providers with `aiProviderSwitcher.codexProviders`, or use the
 Codex management commands. A provider must expose OpenAI's Responses API because
-Codex custom providers only support `wire_api = "responses"`. Base URLs are
-normalized to end in `/v1`. The extension writes only provider metadata and the
+Codex custom providers only support `wire_api = "responses"`. Enter and store
+only the provider root, such as `https://api.example.com`; the extension derives
+the protocol path `/v1` internally. The extension writes only provider metadata and the
 selected model to `%USERPROFILE%\.codex\config.toml`; API keys are not written
 in plaintext there.
+
+When switching Codex to a custom service, the extension calls `/v1/models`
+automatically. It reuses the current model when available, otherwise uses the
+configured default when available, otherwise selects the first returned model.
+You can change the model later from the visual manager.
 
 ## Run
 

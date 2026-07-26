@@ -1,9 +1,14 @@
 export const CODEX_MANAGED_BEGIN = "# BEGIN AI Provider Switcher managed Codex provider";
 export const CODEX_MANAGED_END = "# END AI Provider Switcher managed Codex provider";
 
-export function normalizeCodexBaseUrl(baseUrl: string): string {
-  const normalized = baseUrl.trim().replace(/\/$/, "");
-  return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
+/** Store and display the provider origin, not a protocol-specific API path. */
+export function normalizeProviderRootUrl(baseUrl: string): string {
+  return baseUrl.trim().replace(/\/v1\/?$/i, "").replace(/\/$/, "");
+}
+
+/** Codex custom providers use the OpenAI Responses API under /v1. */
+export function getCodexApiBaseUrl(baseUrl: string): string {
+  return `${normalizeProviderRootUrl(baseUrl)}/v1`;
 }
 
 export function parseTopLevelTomlString(content: string, key: string): string | undefined {

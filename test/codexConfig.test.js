@@ -3,15 +3,18 @@ const test = require("node:test");
 const {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
-  normalizeCodexBaseUrl,
+  getCodexApiBaseUrl,
+  normalizeProviderRootUrl,
   parseTopLevelTomlString,
   removeManagedCodexProviders,
   updateTopLevelTomlKey
 } = require("../out/codexConfig.js");
 
-test("normalizes Codex base URLs to /v1", () => {
-  assert.equal(normalizeCodexBaseUrl("https://api.example.com"), "https://api.example.com/v1");
-  assert.equal(normalizeCodexBaseUrl("https://api.example.com/v1/"), "https://api.example.com/v1");
+test("stores provider roots and derives the Codex API base URL", () => {
+  assert.equal(normalizeProviderRootUrl("https://api.example.com"), "https://api.example.com");
+  assert.equal(normalizeProviderRootUrl("https://api.example.com/v1/"), "https://api.example.com");
+  assert.equal(getCodexApiBaseUrl("https://api.example.com"), "https://api.example.com/v1");
+  assert.equal(getCodexApiBaseUrl("https://api.example.com/v1/"), "https://api.example.com/v1");
 });
 
 test("updates only top-level model fields", () => {

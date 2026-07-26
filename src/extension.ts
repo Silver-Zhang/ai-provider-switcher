@@ -8,11 +8,17 @@ import { URL } from "node:url";
 import {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
-  normalizeCodexBaseUrl,
+  getCodexApiBaseUrl,
+  normalizeProviderRootUrl,
   parseTopLevelTomlString,
   removeManagedCodexProviders,
   updateTopLevelTomlKey
 } from "./codexConfig";
+import {
+  ProviderManagerAction,
+  ProviderManagerPanel,
+  ProviderManagerState
+} from "./providerManagerPanel";
 
 type EnvVar = { name: string; value: string };
 type GatewayProfile = { id: string; name: string; baseUrl: string };
@@ -49,11 +55,12 @@ let statusBarItem: vscode.StatusBarItem;
 
 export function activate(context: vscode.ExtensionContext): void {
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 80);
-  statusBarItem.command = "aiProviderSwitcher.switchMode";
+  statusBarItem.command = "aiProviderSwitcher.openManager";
   context.subscriptions.push(statusBarItem);
 
   context.subscriptions.push(
     vscode.commands.registerCommand("aiProviderSwitcher.switchMode", () => quickSwitch(context)),
+    vscode.commands.registerCommand("aiProviderSwitcher.openManager", () => openProviderManager(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.useOfficial", () => switchToOfficial()),
     vscode.commands.registerCommand("aiProviderSwitcher.useGateway", () => switchToGateway(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.manageGateways", () => manageGateways(context)),
@@ -113,22 +120,26 @@ export function deactivate(): void {
 }
 
 async function quickSwitch(context: vscode.ExtensionContext): Promise<void> {
-  const current = getCurrentMode();
   const selected = await vscode.window.showQuickPick(
     [
       {
-        label: "Use Official Subscription",
-        description: current === ProviderMode.Official ? "current" : "",
-        target: ProviderMode.Official
+        label: "$(hubot) Claude",
+        description: getCurrentMode() === ProviderMode.Official ? "官方服务" : "自定义服务",
+        target: "claude"
       },
       {
-        label: "Use Gateway",
-        description: current === ProviderMode.Gateway ? "current" : "",
-        target: ProviderMode.Gateway
+        label: "$(sparkle) Codex",
+        description: getCodexModeLabel(),
+        target: "codex"
+      },
+      {
+        label: "$(settings-gear) 打开可视化管理界面",
+        description: "集中管理所有服务与模型",
+        target: "manager"
       }
     ],
     {
-      title: "Claude Subscription Switcher"
+      title: "AI Provider Switcher"
     }
   );
 
@@ -136,11 +147,78 @@ async function quickSwitch(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
 
-  if (selected.target === ProviderMode.Official) {
-    await switchToOfficial();
-  } else {
-    await switchToGateway(context);
-  }
+  if (selected.target === "claude") await quickSwitchClaude(context);
+  if (selected.target === "codex") await quickSwitchCodex(context);
+  if (selected.target === "manager") openProviderManager(context);
+}
+
+async function quickSwitchClaude(context: vscode.ExtensionContext): Promise<void> {
+  const current = getCurrentMode();
+  const selected = await vscode.window.showQuickPick(
+    [
+      { label: "官方服务", description: current === ProviderMode.Official ? "当前" : "", target: "official" },
+      { label: "自定义服务", description: current === ProviderMode.Gateway ? "当前" : "", target: "custom" }
+    ],
+    { title: "切换 Claude 服务" }
+  );
+  if (selected?.target === "official") await switchToOfficial();
+  if (selected?.target === "custom") await switchToGateway(context);
+}
+
+async function quickSwitchCodex(context: vscode.ExtensionContext): Promise<void> {
+  const selected = await vscode.window.showQuickPick(
+    [
+      { label: "官方服务", description: getCodexModeLabel() === "官方服务" ? "当前" : "", target: "official" },
+      { label: "自定义服务", description: getCodexModeLabel() !== "官方服务" ? "当前" : "", target: "custom" }
+    ],
+    { title: "切换 Codex 服务" }
+  );
+  if (selected?.target === "official") await switchToCodexOfficial(context);
+  if (selected?.target === "custom") await switchToCodexGateway(context);
+}
+
+function openProviderManager(context: vscode.ExtensionContext): void {
+  ProviderManagerPanel.show(
+    context.extensionUri,
+    () => getProviderManagerState(),
+    async (action) => handleProviderManagerAction(context, action)
+  );
+}
+
+function getProviderManagerState(): ProviderManagerState {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const models = new Map(getCodexModels().map((entry) => [entry.providerId, entry.models.length]));
+  return {
+    claudeMode: getCurrentMode() === ProviderMode.Official ? "官方服务" : "自定义服务",
+    claudeProviders: getGateways().map((provider) => ({ name: provider.name, baseUrl: provider.baseUrl })),
+    codexMode: getCodexModeLabel(),
+    codexModel: settings.get<string>(CODEX_ACTIVE_MODEL_KEY, ""),
+    codexProviders: getCodexProviders().map((provider) => ({
+      name: provider.name,
+      baseUrl: provider.baseUrl,
+      modelCount: models.get(provider.id) ?? 0
+    }))
+  };
+}
+
+function getCodexModeLabel(): string {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const id = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  return getCodexProviders().find((provider) => provider.id === id)?.name ?? "官方服务";
+}
+
+async function handleProviderManagerAction(
+  context: vscode.ExtensionContext,
+  action: ProviderManagerAction
+): Promise<void> {
+  if (action === "switchClaude") await quickSwitchClaude(context);
+  if (action === "manageClaude") await manageGateways(context);
+  if (action === "refreshClaude") await refreshGatewayModels(context);
+  if (action === "switchCodex") await switchToCodexGateway(context);
+  if (action === "codexOfficial") await switchToCodexOfficial(context);
+  if (action === "manageCodex") await manageCodexProviders(context);
+  if (action === "refreshCodex") await refreshCodexModels(context);
+  if (action === "selectCodexModel") await selectCodexModel(context);
 }
 
 function getCurrentMode(): ProviderMode {
@@ -309,7 +387,7 @@ async function addGateway(): Promise<GatewayProfile | undefined> {
   }
 
   const id = `${name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now()}`;
-  const gateway: GatewayProfile = { id, name: name.trim(), baseUrl: baseUrl.trim().replace(/\/$/, "") };
+  const gateway: GatewayProfile = { id, name: name.trim(), baseUrl: normalizeProviderRootUrl(baseUrl) };
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   await settings.update(GATEWAYS_KEY.split(".").slice(1).join("."), [...getGateways(), gateway], vscode.ConfigurationTarget.Global);
   vscode.window.showInformationMessage(`已添加中转站：${gateway.name}`);
@@ -408,7 +486,7 @@ async function getStoredGatewayToken(
 }
 
 function requestGatewayModels(baseUrl: string, token: string): Promise<string[]> {
-  const endpoint = new URL(`${baseUrl.replace(/\/$/, "")}/v1/models`);
+  const endpoint = new URL(`${normalizeProviderRootUrl(baseUrl)}/v1/models`);
   return new Promise((resolve, reject) => {
     const request = https.request(
       endpoint,
@@ -485,18 +563,30 @@ async function switchToCodexGateway(context: vscode.ExtensionContext): Promise<v
   if (!apiKey) return;
 
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
-  const cachedModels = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
-  const configuredDefault = settings.get<string>("codexDefaultModel", "gpt-5.6-sol");
-  const model = await pickCodexModelForProvider(provider, cachedModels, configuredDefault);
-  if (!model) return;
 
   try {
+    let models = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
+    if (models.length === 0) {
+      models = await requestCodexModels(provider.baseUrl, apiKey);
+      await saveCodexModels(provider.id, models);
+    }
+    if (models.length === 0) {
+      throw new Error("该 Provider 没有返回可用模型");
+    }
+    const currentModel = settings.get<string>(CODEX_ACTIVE_MODEL_KEY, "");
+    const configuredDefault = settings.get<string>("codexDefaultModel", "");
+    const model = models.includes(currentModel)
+      ? currentModel
+      : models.includes(configuredDefault)
+        ? configuredDefault
+        : models[0];
+
     await writeCodexConfiguration(context, provider, model);
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, provider.id, vscode.ConfigurationTarget.Global);
     await settings.update(CODEX_ACTIVE_MODEL_KEY, model, vscode.ConfigurationTarget.Global);
     await refreshStatusBar();
     await offerReload(
-      `Codex 已切换到“${provider.name}”的 ${model}。需要重新加载 VS Code 才会让 Codex 使用新 Provider。是否立即重载？`
+      `Codex 已切换到“${provider.name}”。已发现 ${models.length} 个模型，当前默认使用 ${model}；可稍后在管理界面更换。是否立即重载？`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
@@ -565,7 +655,7 @@ async function addCodexProvider(): Promise<CodexProviderProfile | undefined> {
 
   const baseUrl = await vscode.window.showInputBox({
     title: "添加 Codex Provider",
-    prompt: "OpenAI-compatible Base URL，例如 https://example.com 或 https://example.com/v1",
+    prompt: "输入服务根地址，例如 https://api.example.com；不要填写 /v1，插件会按 Codex 协议自动补全",
     value: "https://"
   });
   if (!baseUrl?.trim() || !/^https?:\/\//i.test(baseUrl.trim())) {
@@ -577,7 +667,7 @@ async function addCodexProvider(): Promise<CodexProviderProfile | undefined> {
   const provider: CodexProviderProfile = {
     id,
     name: name.trim(),
-    baseUrl: normalizeCodexBaseUrl(baseUrl.trim())
+    baseUrl: normalizeProviderRootUrl(baseUrl.trim())
   };
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   await settings.update(
@@ -689,27 +779,6 @@ async function getOrRequestCodexApiKey(
   return apiKey;
 }
 
-async function pickCodexModelForProvider(
-  provider: CodexProviderProfile,
-  models: string[],
-  fallback: string
-): Promise<string | undefined> {
-  if (models.length === 0) {
-    const model = await vscode.window.showInputBox({
-      title: `设置 ${provider.name} 的 Codex 模型`,
-      prompt: "请输入网关支持的 OpenAI Responses API 模型 ID",
-      value: fallback
-    });
-    return model?.trim() || undefined;
-  }
-
-  const selected = await vscode.window.showQuickPick(
-    models.map((model) => ({ label: model, model })),
-    { title: `选择 ${provider.name} 的 Codex 模型` }
-  );
-  return selected?.model;
-}
-
 async function refreshCodexModels(context: vscode.ExtensionContext): Promise<void> {
   const provider = await pickCodexProvider();
   if (!provider) return;
@@ -788,7 +857,7 @@ async function getStoredCodexApiKey(
 }
 
 function requestCodexModels(baseUrl: string, token: string): Promise<string[]> {
-  const endpoint = new URL(`${normalizeCodexBaseUrl(baseUrl)}/models`);
+  const endpoint = new URL(`${getCodexApiBaseUrl(baseUrl)}/models`);
   return new Promise((resolve, reject) => {
     const request = https.request(
       endpoint,
@@ -860,7 +929,7 @@ function getCodexProviders(): CodexProviderProfile[] {
     .map((item) => ({
       id: String(item.id ?? "").trim(),
       name: String(item.name ?? "").trim(),
-      baseUrl: normalizeCodexBaseUrl(String(item.baseUrl ?? "").trim())
+      baseUrl: normalizeProviderRootUrl(String(item.baseUrl ?? "").trim())
     }))
     .filter((provider) => provider.id && provider.name && provider.baseUrl);
 }
@@ -916,7 +985,7 @@ function serializeManagedCodexProviders(providers: CodexProviderProfile[]): stri
     return [
       `[model_providers.${JSON.stringify(provider.id)}]`,
       `name = ${JSON.stringify(provider.name)}`,
-      `base_url = ${JSON.stringify(provider.baseUrl)}`,
+      `base_url = ${JSON.stringify(getCodexApiBaseUrl(provider.baseUrl))}`,
       `wire_api = "responses"`,
       ``,
       `[model_providers.${JSON.stringify(provider.id)}.auth]`,
@@ -1070,6 +1139,6 @@ async function refreshStatusBar(): Promise<void> {
     ? `Codex: ${codexProvider.name}${codexModel ? `/${codexModel}` : ""}`
     : "Codex: Official";
   statusBarItem.text = `${claudeLabel} · ${codexLabel}`;
-  statusBarItem.tooltip = "Click to switch Claude mode; use AI Provider Switcher commands to manage Codex providers";
+  statusBarItem.tooltip = "打开 AI Provider Switcher 可视化管理界面";
   statusBarItem.show();
 }
