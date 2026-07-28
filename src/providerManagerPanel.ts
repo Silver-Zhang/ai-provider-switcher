@@ -4,6 +4,9 @@ export type ProviderManagerAction =
   | "switchClaude"
   | "manageClaude"
   | "refreshClaude"
+  | "mapClaudeModels"
+  | "configureClaudePermissions"
+  | "inspectClaude"
   | "switchCodex"
   | "codexOfficial"
   | "manageCodex"
@@ -12,7 +15,13 @@ export type ProviderManagerAction =
 
 export type ProviderManagerState = {
   claudeMode: string;
-  claudeProviders: Array<{ name: string; baseUrl: string }>;
+  claudeProviders: Array<{
+    name: string;
+    baseUrl: string;
+    active: boolean;
+    mapping: string;
+    permissionStrategy: string;
+  }>;
   codexMode: string;
   codexModel: string;
   codexProviders: Array<{ name: string; baseUrl: string; modelCount: number }>;
@@ -97,14 +106,14 @@ export class ProviderManagerPanel {
   <main class="shell">
     <header><div><h1>AI Provider Switcher</h1><p class="subtitle">统一管理 Claude 与 Codex 的官方服务、中转服务和模型。</p></div></header>
     <section class="grid">
-      ${providerCard("Claude", state.claudeMode, "", state.claudeProviders.map((item) => ({ ...item, count: "" })), [
-        ["快速切换", "switchClaude", false], ["管理服务", "manageClaude", true], ["刷新模型", "refreshClaude", true]
+      ${providerCard("Claude", state.claudeMode, "", state.claudeProviders.map((item) => ({ ...item, count: item.active ? "当前" : "", mapping: `${item.mapping} · 命令：${item.permissionStrategy}` })), [
+        ["快速切换", "switchClaude", false], ["模型映射", "mapClaudeModels", false], ["命令策略", "configureClaudePermissions", false], ["管理服务", "manageClaude", true], ["检测外部配置", "inspectClaude", true], ["刷新模型", "refreshClaude", true]
       ])}
       ${providerCard("Codex", state.codexMode, "模型请在 Codex 页面原生模型栏中选择", state.codexProviders.map((item) => ({ ...item, count: `${item.modelCount} 个模型` })), [
         ["切换服务", "switchCodex", false], ["打开 Codex 选择模型", "openCodex", false], ["使用官方", "codexOfficial", true], ["管理服务", "manageCodex", true], ["刷新模型", "refreshCodex", true]
       ])}
     </section>
-    <div class="note">URL 只填写服务根地址，例如 https://api.example.com。Claude 与 Codex 所需的 /v1 路径由插件按协议自动补全。Codex Provider 启用后，模型会同步到 Codex 页面自身的模型栏中选择。API Key 不在此页面回显。</div>
+    <div class="note">URL 只填写服务根地址，例如 https://api.example.com。若 Anthropic 兼容服务提供非 Claude 模型，请使用“模型映射”。Auto 并非“所有命令放行”：未命中窄 allow 规则的命令仍由独立 Sonnet 5 分类器检查，服务临时不可用时会安全阻塞。要完全不经过分类器只能在隔离环境使用“命令策略 → 完全放行”。API Key 不在此页面回显。</div>
   </main>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
@@ -118,11 +127,11 @@ function providerCard(
   name: string,
   mode: string,
   model: string,
-  providers: Array<{ name: string; baseUrl: string; count: string }>,
+  providers: Array<{ name: string; baseUrl: string; count: string; mapping?: string }>,
   actions: Array<[string, ProviderManagerAction, boolean]>
 ): string {
   const providerRows = providers.length
-    ? providers.map((item) => `<div class="provider"><span>${escapeHtml(item.name)}</span><span class="url">${escapeHtml(item.baseUrl)}</span><span class="count">${escapeHtml(item.count)}</span></div>`).join("")
+    ? providers.map((item) => `<div class="provider"><span><strong>${escapeHtml(item.name)}</strong>${item.mapping ? `<br><small class="url">映射：${escapeHtml(item.mapping)}</small>` : ""}</span><span class="url">${escapeHtml(item.baseUrl)}</span><span class="count">${escapeHtml(item.count)}</span></div>`).join("")
     : '<div class="provider"><span>尚未添加自定义服务</span></div>';
   const buttons = actions.map(([label, action, secondary]) => `<button class="${secondary ? "secondary" : ""}" data-action="${action}">${label}</button>`).join("");
   return `<article class="card"><div class="card-head"><h2>${name}</h2><span class="badge">${escapeHtml(mode)}</span></div>${model ? `<div class="model">${model}</div>` : ""}<div class="providers">${providerRows}</div><div class="actions">${buttons}</div></article>`;

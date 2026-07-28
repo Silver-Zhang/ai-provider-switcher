@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.3.2",
+  "version": "0.4.1",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -89,6 +89,18 @@
         "title": "AI Provider Switcher: Show Claude Gateway Models"
       },
       {
+        "command": "aiProviderSwitcher.configureClaudeModelMapping",
+        "title": "AI Provider Switcher: Configure Claude Model Mapping"
+      },
+      {
+        "command": "aiProviderSwitcher.configureClaudePermissions",
+        "title": "AI Provider Switcher: Configure Claude Command Strategy"
+      },
+      {
+        "command": "aiProviderSwitcher.inspectClaudeConfiguration",
+        "title": "AI Provider Switcher: Inspect Other Claude Configuration"
+      },
+      {
         "command": "aiProviderSwitcher.switchCodexProvider",
         "title": "AI Provider Switcher: Switch Codex Provider"
       },
@@ -124,11 +136,6 @@
     "configuration": {
       "title": "AI Provider Switcher",
       "properties": {
-        "aiProviderSwitcher.gatewayBaseUrl": {
-          "type": "string",
-          "default": "https://api-sub2api.reallab.eu.cc",
-          "description": "Provider root URL used for Claude Code; /v1/models is added automatically for model discovery."
-        },
         "aiProviderSwitcher.enableGatewayDiscovery": {
           "type": "boolean",
           "default": true,
@@ -163,16 +170,39 @@
               },
               "baseUrl": {
                 "type": "string"
+              },
+              "modelMapping": {
+                "type": "object",
+                "description": "Optional mapping from Claude model families and agents to model IDs accepted by this Anthropic-compatible provider.",
+                "required": [
+                  "mainModel",
+                  "opusModel",
+                  "sonnetModel",
+                  "haikuModel",
+                  "subagentModel"
+                ],
+                "properties": {
+                  "mainModel": { "type": "string" },
+                  "fableModel": { "type": "string" },
+                  "opusModel": { "type": "string" },
+                  "sonnetModel": { "type": "string" },
+                  "haikuModel": { "type": "string" },
+                  "subagentModel": { "type": "string" },
+                  "supports1m": { "type": "boolean", "default": false },
+                  "effortLevel": {
+                    "type": "string",
+                    "enum": ["auto", "low", "medium", "high", "xhigh", "max"]
+                  }
+                }
+              },
+              "permissionStrategy": {
+                "type": "string",
+                "enum": ["auto", "acceptEdits", "manual", "bypassPermissions"],
+                "description": "Command execution strategy applied when this Claude provider becomes active."
               }
             }
           },
-          "default": [
-            {
-              "id": "reallab",
-              "name": "RealLab Gateway",
-              "baseUrl": "https://api-sub2api.reallab.eu.cc"
-            }
-          ]
+          "default": []
         },
         "aiProviderSwitcher.gatewayModels": {
           "type": "array",
@@ -201,6 +231,11 @@
           },
           "default": []
         },
+        "aiProviderSwitcher.claudeActiveProviderId": {
+          "type": "string",
+          "default": "",
+          "description": "Currently selected Claude custom provider ID."
+        },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",
           "description": "Named OpenAI Responses API-compatible Codex providers. Enter only the provider root URL; /v1 is added automatically. API keys are stored separately in VS Code Secret Storage and an encrypted local helper file.",
@@ -223,13 +258,7 @@
               }
             }
           },
-          "default": [
-            {
-              "id": "pateway",
-              "name": "Pateway",
-              "baseUrl": "https://api.pateway.ai"
-            }
-          ]
+          "default": []
         },
         "aiProviderSwitcher.codexModels": {
           "type": "array",
