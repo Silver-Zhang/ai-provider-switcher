@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as https from "node:https";
+import { IncomingHttpHeaders } from "node:http";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -8,18 +9,37 @@ import { URL } from "node:url";
 import {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
+  createCodexAuthConfig,
   createCodexModelCatalog,
+  findUnmanagedCodexProxyEnv,
   getCodexApiBaseUrl,
+  normalizeCodexProxyUrl,
   normalizeProviderRootUrl,
+  parseMacOsProxySettings,
+  parseWindowsProxyServer,
   parseTopLevelTomlString,
+  removeManagedCodexEnv,
   removeManagedCodexProviders,
+  removeUnmanagedCodexProxyEnv,
+  updateManagedCodexEnv,
   updateTopLevelTomlKey
 } from "./codexConfig";
 import {
   ProviderManagerAction,
+  ProviderManagerMessage,
   ProviderManagerPanel,
   ProviderManagerState
 } from "./providerManagerPanel";
+import {
+  ProviderUsageConfiguration,
+  ProviderUsageSnapshot,
+  formatProviderUsageSummary,
+  hasProviderUsage,
+  normalizeUsageConfiguration,
+  parseProviderUsage,
+  requestProviderUsage,
+  validateUsageEndpoint
+} from "./providerUsage";
 import {
   ClaudeModelMapping,
   ClaudePermissionStrategy,
@@ -49,9 +69,10 @@ type GatewayProfile = {
   baseUrl: string;
   modelMapping?: ClaudeModelMapping;
   permissionStrategy?: ClaudePermissionStrategy;
+  usage?: ProviderUsageConfiguration;
 };
 type GatewayModels = { gatewayId: string; models: string[]; updatedAt: string };
-type CodexProviderProfile = { id: string; name: string; baseUrl: string };
+type CodexProviderProfile = { id: string; name: string; baseUrl: string; usage?: ProviderUsageConfiguration };
 type CodexModels = { providerId: string; models: string[]; updatedAt: string };
 
 enum ProviderMode {
@@ -74,7 +95,13 @@ const CODEX_ACTIVE_PROVIDER_KEY = "codexActiveProviderId";
 const CODEX_ACTIVE_MODEL_KEY = "codexActiveModel";
 const CODEX_CONFIG_FILE = path.join(os.homedir(), ".codex", "config.toml");
 const CODEX_MODEL_CATALOG_FILE = path.join(os.homedir(), ".codex", "ai-provider-switcher-models.json");
+const CODEX_ENV_FILE = path.join(os.homedir(), ".codex", ".env");
 const CODEX_BACKUP_KEY = "codex.originalTopLevelConfig";
+const CODEX_PROXY_URL_KEY = "codexProxyUrl";
+const CODEX_PROXY_MODE_KEY = "codexProxyMode";
+const PROVIDER_USAGE_SNAPSHOTS_KEY = "providerUsageSnapshots";
+
+type CodexProxyMode = "officialOnly" | "allProviders";
 
 const MANAGED_ENV_KEYS = new Set([
   "ANTHROPIC_BASE_URL",
@@ -135,7 +162,16 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("aiProviderSwitcher.refreshCodexModels", () =>
       refreshCodexModels(context)
     ),
-    vscode.commands.registerCommand("aiProviderSwitcher.showCodexModels", () => showCodexModels())
+    vscode.commands.registerCommand("aiProviderSwitcher.showCodexModels", () => showCodexModels()),
+    vscode.commands.registerCommand("aiProviderSwitcher.configureCodexProxy", () =>
+      configureCodexProxy()
+    ),
+    vscode.commands.registerCommand("aiProviderSwitcher.refreshProviderUsage", () =>
+      refreshProviderUsage(context)
+    ),
+    vscode.commands.registerCommand("aiProviderSwitcher.configureProviderUsage", () =>
+      configureProviderUsage(context)
+    )
   );
 
   context.subscriptions.push(
@@ -234,31 +270,42 @@ function openProviderManager(context: vscode.ExtensionContext): void {
   ProviderManagerPanel.show(
     context.extensionUri,
     () => getProviderManagerState(),
-    async (action) => handleProviderManagerAction(context, action)
+    async (message) => handleProviderManagerAction(context, message)
   );
 }
 
 function getProviderManagerState(): ProviderManagerState {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   const models = new Map(getCodexModels().map((entry) => [entry.providerId, entry.models.length]));
+  const usage = new Map(getProviderUsageSnapshots().map((entry) => [`${entry.providerKind}:${entry.providerId}`, entry]));
   const currentClaudeProvider = getCurrentClaudeProvider();
   return {
     claudeMode: currentClaudeProvider?.name ?? (getCurrentMode() === ProviderMode.Official ? "官方服务" : "未识别的自定义服务"),
     claudeProviders: getGateways().map((provider) => ({
+      id: provider.id,
       name: provider.name,
       baseUrl: provider.baseUrl,
       active: provider.id === currentClaudeProvider?.id,
       mapping: provider.modelMapping
         ? `${provider.modelMapping.mainModel} / 快速：${provider.modelMapping.haikuModel}${provider.modelMapping.supports1m ? " / 1M" : ""}`
         : "未配置",
-      permissionStrategy: getClaudePermissionStrategyLabel(provider.permissionStrategy)
+      permissionStrategy: getClaudePermissionStrategyLabel(provider.permissionStrategy),
+      hasUsageConfig: Boolean(provider.usage),
+      usageEndpoint: provider.usage?.endpoint,
+      usageMappings: formatUsageMappings(provider.usage),
+      usage: formatProviderUsageSummary(usage.get(`claude:${provider.id}`))
     })),
     codexMode: getCodexModeLabel(),
     codexModel: settings.get<string>(CODEX_ACTIVE_MODEL_KEY, ""),
     codexProviders: getCodexProviders().map((provider) => ({
+      id: provider.id,
       name: provider.name,
       baseUrl: provider.baseUrl,
-      modelCount: models.get(provider.id) ?? 0
+      modelCount: models.get(provider.id) ?? 0,
+      hasUsageConfig: Boolean(provider.usage),
+      usageEndpoint: provider.usage?.endpoint,
+      usageMappings: formatUsageMappings(provider.usage),
+      usage: formatProviderUsageSummary(usage.get(`codex:${provider.id}`))
     }))
   };
 }
@@ -269,20 +316,75 @@ function getCodexModeLabel(): string {
   return getCodexProviders().find((provider) => provider.id === id)?.name ?? "官方服务";
 }
 
+function getUsageProviderById(
+  kind: "claude" | "codex",
+  id: string
+): UsageProviderSelection | undefined {
+  const provider = kind === "claude"
+    ? getGateways().find((item) => item.id === id)
+    : getCodexProviders().find((item) => item.id === id);
+  return provider ? { kind, provider } : undefined;
+}
+
+function formatUsageMappings(usage: ProviderUsageConfiguration | undefined): string | undefined {
+  if (!usage) return undefined;
+  const fields = [
+    ["余额", usage.balanceRemainingPath],
+    ["5小时", usage.fiveHourUsedPercentPath],
+    ["周", usage.weeklyUsedPercentPath]
+  ].filter(([, path]) => path).map(([label, path]) => `${label}=${path}`);
+  return fields.length ? fields.join(" · ") : "自动识别字段";
+}
+
 async function handleProviderManagerAction(
   context: vscode.ExtensionContext,
-  action: ProviderManagerAction
+  message: ProviderManagerMessage
 ): Promise<void> {
-  if (action === "switchClaude") await quickSwitchClaude(context);
+  const action = message.action;
+  if (!action) return;
+  const targeted = message.providerKind && message.providerId
+    ? getUsageProviderById(message.providerKind, message.providerId)
+    : undefined;
+  if (action === "refreshUsage" && targeted) {
+    await refreshSelectedProviderUsage(targeted, context);
+    return;
+  }
+  if (action === "viewUsageConfig" && targeted) {
+    await showProviderUsageDetails(targeted);
+    return;
+  }
+  if (action === "editUsageConfig" && targeted) {
+    await configureProviderUsageForSelection(context, targeted);
+    return;
+  }
+  if (action === "deleteUsageConfig" && targeted) {
+    await deleteProviderUsageConfiguration(targeted);
+    return;
+  }
+  if (action === "configureUsage" && targeted) {
+    await configureProviderUsageForSelection(context, targeted);
+    return;
+  }
+  if (action === "switchClaude") {
+    const provider = message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined;
+    await switchToGateway(context, provider);
+  }
   if (action === "manageClaude") await manageGateways(context);
   if (action === "inspectClaude") await inspectClaudeConfiguration();
-  if (action === "refreshClaude") await refreshGatewayModels(context);
-  if (action === "mapClaudeModels") await configureClaudeModelMapping(context);
-  if (action === "configureClaudePermissions") await configureClaudePermissionStrategy();
-  if (action === "switchCodex") await switchToCodexGateway(context);
+  if (action === "refreshClaude") await refreshGatewayModels(context, message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined);
+  if (action === "mapClaudeModels") await configureClaudeModelMapping(context, message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined);
+  if (action === "configureClaudePermissions") await configureClaudePermissionStrategy(message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined);
+  if (action === "switchCodex") {
+    const provider = message.providerKind === "codex" ? getCodexProviders().find((item) => item.id === message.providerId) : undefined;
+    await switchToCodexGateway(context, provider);
+  }
   if (action === "codexOfficial") await switchToCodexOfficial(context);
   if (action === "manageCodex") await manageCodexProviders(context);
-  if (action === "refreshCodex") await refreshCodexModels(context);
+  if (action === "refreshCodex") await refreshCodexModels(context, message.providerKind === "codex" ? getCodexProviders().find((item) => item.id === message.providerId) : undefined);
+  if (action === "configureCodexProxy") await configureCodexProxy();
+  if (action === "refreshUsage") await refreshProviderUsage(context);
+  if (action === "configureUsage") await configureProviderUsage(context);
+  if (action === "manageUsage") await manageProviderUsage(context);
   if (action === "openCodex") await vscode.commands.executeCommand("chatgpt.openSidebar");
 }
 
@@ -517,8 +619,8 @@ async function updateClaudeUserDefaultPermissionMode(
   await fs.writeFile(file, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
 }
 
-async function configureClaudePermissionStrategy(): Promise<void> {
-  const gateway = await pickGateway();
+async function configureClaudePermissionStrategy(selectedGateway?: GatewayProfile): Promise<void> {
+  const gateway = selectedGateway ?? await pickGateway();
   if (!gateway) return;
   const models = getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? [];
   const strategy = await chooseClaudePermissionStrategy(gateway, models);
@@ -933,8 +1035,8 @@ async function clearGatewayToken(context: vscode.ExtensionContext): Promise<void
   vscode.window.showInformationMessage(`已清除“${selected.gateway.name}”的已保存 Token。`);
 }
 
-async function refreshGatewayModels(context: vscode.ExtensionContext): Promise<void> {
-  const gateway = await pickGateway();
+async function refreshGatewayModels(context: vscode.ExtensionContext, selectedGateway?: GatewayProfile): Promise<void> {
+  const gateway = selectedGateway ?? await pickGateway();
   if (!gateway) return;
 
   const token = await getStoredGatewayToken(context, gateway);
@@ -944,8 +1046,10 @@ async function refreshGatewayModels(context: vscode.ExtensionContext): Promise<v
   }
 
   try {
-    const models = await requestGatewayModels(gateway.baseUrl, token);
+    const response = await requestGatewayModels(gateway.baseUrl, token);
+    const models = response.models;
     await saveGatewayModels(gateway.id, models);
+    await saveUsageFromResponseHeaders("claude", gateway.id, response.headers);
     const choice = await vscode.window.showInformationMessage(
       `已从“${gateway.name}”刷新 ${models.length} 个模型。Claude Code 需要重载后自行更新模型发现。`,
       "立即重载",
@@ -1011,7 +1115,7 @@ async function configureClaudeModelMapping(
   const token = knownToken ?? await getStoredGatewayToken(context, gateway);
   if (models.length === 0 && token) {
     try {
-      models = await requestGatewayModels(gateway.baseUrl, token);
+      models = (await requestGatewayModels(gateway.baseUrl, token)).models;
       if (models.length > 0) await saveGatewayModels(gateway.id, models);
     } catch {
       // Manual entry remains available when the provider does not expose /v1/models.
@@ -1123,7 +1227,7 @@ async function offerModelMappingForGateway(
   let models = getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? [];
   if (models.length === 0) {
     try {
-      models = await requestGatewayModels(gateway.baseUrl, token);
+      models = (await requestGatewayModels(gateway.baseUrl, token)).models;
       if (models.length > 0) await saveGatewayModels(gateway.id, models);
     } catch {
       const choice = await vscode.window.showWarningMessage(
@@ -1204,7 +1308,7 @@ async function getStoredGatewayToken(
   return context.secrets.get(`${SECRET_KEY_PREFIX}${gateway.id}`);
 }
 
-function requestGatewayModels(baseUrl: string, token: string): Promise<string[]> {
+function requestGatewayModels(baseUrl: string, token: string): Promise<{ models: string[]; headers: IncomingHttpHeaders }> {
   const endpoint = new URL(`${normalizeProviderRootUrl(baseUrl)}/v1/models`);
   return new Promise((resolve, reject) => {
     const request = https.request(
@@ -1235,7 +1339,7 @@ function requestGatewayModels(baseUrl: string, token: string): Promise<string[]>
             const models = (parsed.data ?? [])
               .map((item) => String(item.id ?? "").trim())
               .filter(Boolean);
-            resolve([...new Set(models)].sort());
+            resolve({ models: [...new Set(models)].sort(), headers: response.headers });
           } catch {
             reject(new Error("网关返回的模型列表不是有效 JSON"));
           }
@@ -1272,8 +1376,8 @@ function getGatewayModels(): GatewayModels[] {
     .filter((entry) => entry.gatewayId && entry.models.length > 0);
 }
 
-async function switchToCodexGateway(context: vscode.ExtensionContext): Promise<void> {
-  const provider = await pickCodexProvider();
+async function switchToCodexGateway(context: vscode.ExtensionContext, selectedProvider?: CodexProviderProfile): Promise<void> {
+  const provider = selectedProvider ?? await pickCodexProvider();
   if (!provider) return;
 
   const proceed = await confirmCodexProviderSwitch(provider.name);
@@ -1287,8 +1391,10 @@ async function switchToCodexGateway(context: vscode.ExtensionContext): Promise<v
   try {
     let models = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
     if (models.length === 0) {
-      models = await requestCodexModels(provider.baseUrl, apiKey);
+      const response = await requestCodexModels(provider.baseUrl, apiKey);
+      models = response.models;
       await saveCodexModels(provider.id, models);
+      await saveUsageFromResponseHeaders("codex", provider.id, response.headers);
     }
     if (models.length === 0) {
       throw new Error("该 Provider 没有返回可用模型");
@@ -1296,6 +1402,7 @@ async function switchToCodexGateway(context: vscode.ExtensionContext): Promise<v
     await writeCodexConfiguration(context, provider, models);
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, provider.id, vscode.ConfigurationTarget.Global);
     await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
+    await synchronizeCodexProxyForProvider(settings);
     await refreshStatusBar();
     await offerReload(
       `Codex 已切换到“${provider.name}”。已同步 ${models.length} 个模型；重载后请直接在 Codex 页面原生模型栏中选择。是否立即重载？`
@@ -1332,6 +1439,7 @@ async function switchToCodexOfficial(context: vscode.ExtensionContext): Promise<
 
     const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, "", vscode.ConfigurationTarget.Global);
+    await synchronizeCodexProxyForProvider(settings);
     await refreshStatusBar();
     await offerReload("Codex 已恢复为官方 OpenAI Provider。是否立即重载 VS Code？");
   } catch (error) {
@@ -1349,6 +1457,7 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
       { label: "删除 Codex 中转站", action: "remove" },
       { label: "清除某个 Codex API Key", action: "clear" },
       { label: "刷新并同步 Codex 模型", action: "refresh" },
+      { label: "配置 Codex WebSocket 代理", action: "proxy" },
       { label: "打开 Codex 页面选择模型", action: "open" },
       { label: "查看 Codex 模型", action: "show" }
     ],
@@ -1362,6 +1471,7 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
   if (action.action === "remove") await removeCodexProvider(context);
   if (action.action === "clear") await clearCodexApiKey(context);
   if (action.action === "refresh") await refreshCodexModels(context);
+  if (action.action === "proxy") await configureCodexProxy();
   if (action.action === "open") await vscode.commands.executeCommand("chatgpt.openSidebar");
   if (action.action === "show") await showCodexModels();
 }
@@ -1496,8 +1606,8 @@ async function getOrRequestCodexApiKey(
   return apiKey;
 }
 
-async function refreshCodexModels(context: vscode.ExtensionContext): Promise<void> {
-  const provider = await pickCodexProvider();
+async function refreshCodexModels(context: vscode.ExtensionContext, selectedProvider?: CodexProviderProfile): Promise<void> {
+  const provider = selectedProvider ?? await pickCodexProvider();
   if (!provider) return;
 
   const apiKey = await getStoredCodexApiKey(context, provider);
@@ -1507,8 +1617,10 @@ async function refreshCodexModels(context: vscode.ExtensionContext): Promise<voi
   }
 
   try {
-    const models = await requestCodexModels(provider.baseUrl, apiKey);
+    const response = await requestCodexModels(provider.baseUrl, apiKey);
+    const models = response.models;
     await saveCodexModels(provider.id, models);
+    await saveUsageFromResponseHeaders("codex", provider.id, response.headers);
     const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
     const activeProviderId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
     if (activeProviderId === provider.id) {
@@ -1548,7 +1660,7 @@ async function getStoredCodexApiKey(
   return context.secrets.get(`${CODEX_SECRET_KEY_PREFIX}${provider.id}`);
 }
 
-function requestCodexModels(baseUrl: string, token: string): Promise<string[]> {
+function requestCodexModels(baseUrl: string, token: string): Promise<{ models: string[]; headers: IncomingHttpHeaders }> {
   const endpoint = new URL(`${getCodexApiBaseUrl(baseUrl)}/models`);
   return new Promise((resolve, reject) => {
     const request = https.request(
@@ -1573,7 +1685,7 @@ function requestCodexModels(baseUrl: string, token: string): Promise<string[]> {
             const models = (parsed.data ?? [])
               .map((item) => String(item.id ?? "").trim())
               .filter(Boolean);
-            resolve([...new Set(models)].sort());
+            resolve({ models: [...new Set(models)].sort(), headers: response.headers });
           } catch {
             reject(new Error("网关返回的 Codex 模型列表不是有效 JSON"));
           }
@@ -1611,6 +1723,433 @@ function getCodexModels(): CodexModels[] {
     .filter((entry) => entry.providerId && entry.models.length > 0);
 }
 
+type UsageProviderSelection = {
+  kind: "claude" | "codex";
+  provider: GatewayProfile | CodexProviderProfile;
+};
+
+async function pickUsageProvider(title: string): Promise<UsageProviderSelection | undefined> {
+  const items = [
+    ...getGateways().map((provider) => ({
+      label: `Claude · ${provider.name}`,
+      description: provider.usage?.endpoint ?? provider.baseUrl,
+      selection: { kind: "claude" as const, provider }
+    })),
+    ...getCodexProviders().map((provider) => ({
+      label: `Codex · ${provider.name}`,
+      description: provider.usage?.endpoint ?? provider.baseUrl,
+      selection: { kind: "codex" as const, provider }
+    }))
+  ];
+  if (!items.length) {
+    vscode.window.showInformationMessage("请先添加至少一个 Claude 或 Codex 自定义 Provider。");
+    return undefined;
+  }
+  return (await vscode.window.showQuickPick(items, { title }))?.selection;
+}
+
+async function configureProviderUsage(context: vscode.ExtensionContext, selectedProvider?: UsageProviderSelection): Promise<void> {
+  const selected = selectedProvider ?? await pickUsageProvider("配置 Provider 用量与额度 API");
+  if (!selected) return;
+  const current = selected.provider.usage;
+  const action = await vscode.window.showQuickPick([
+    {
+      label: "自动识别常见额度格式",
+      description: "配置只读 GET 接口，自动寻找 balance、five_hour 和 weekly 字段",
+      action: "automatic"
+    },
+    {
+      label: "配置 JSON 字段路径",
+      description: "适配返回字段名称不同的 Provider",
+      action: "custom"
+    },
+    ...(current ? [{ label: "清除额度 API 配置", description: "保留已缓存快照", action: "clear" }] : [])
+  ], { title: `${selected.provider.name} · 用量与额度` });
+  if (!action) return;
+  if (action.action === "clear") {
+    await updateProviderUsageConfiguration(selected, undefined);
+    vscode.window.showInformationMessage(`已清除“${selected.provider.name}”的额度 API 配置。`);
+    return;
+  }
+
+  const endpointInput = await vscode.window.showInputBox({
+    title: `${selected.provider.name} · 额度 API 地址`,
+    prompt: "只支持返回 JSON 的 GET 接口。优先使用 HTTPS 和只读凭据；请求会复用该 Provider 已保存的 Key。",
+    value: current?.endpoint ?? `${selected.provider.baseUrl.replace(/\/$/, "")}/usage`,
+    ignoreFocusOut: true
+  });
+  if (!endpointInput?.trim()) return;
+  let endpoint: string;
+  try {
+    endpoint = validateUsageEndpoint(endpointInput);
+  } catch (error) {
+    vscode.window.showErrorMessage(error instanceof Error ? error.message : "额度 API 地址无效");
+    return;
+  }
+  if (endpoint.startsWith("http://")) {
+    const confirm = await vscode.window.showWarningMessage(
+      "该额度 API 使用 HTTP，Provider Key 和账户用量数据缺少 TLS 保护。是否仍然保存？",
+      { modal: true },
+      "仍然保存"
+    );
+    if (confirm !== "仍然保存") return;
+  }
+  if (new URL(endpoint).origin !== new URL(selected.provider.baseUrl).origin) {
+    const confirm = await vscode.window.showWarningMessage(
+      `额度 API 位于 ${new URL(endpoint).origin}，与 Provider ${new URL(selected.provider.baseUrl).origin} 不同。刷新时会把该 Provider 的已保存凭据发送到额度 API。请只在确认该域名属于服务商时继续。`,
+      { modal: true },
+      "确认域名并保存"
+    );
+    if (confirm !== "确认域名并保存") return;
+  }
+
+  let configuration: ProviderUsageConfiguration = { endpoint };
+  if (action.action === "custom") {
+    const mappingInput = await vscode.window.showInputBox({
+      title: "配置额度 JSON 路径",
+      prompt: "输入 JSON 对象。只填写 Provider 实际提供的路径；支持 a.b.c 和 items[0].value。",
+      value: JSON.stringify({
+        fiveHourUsedPercentPath: current?.fiveHourUsedPercentPath ?? "quota.five_hour.used_percent",
+        fiveHourResetPath: current?.fiveHourResetPath ?? "quota.five_hour.reset_at",
+        weeklyUsedPercentPath: current?.weeklyUsedPercentPath ?? "quota.weekly.used_percent",
+        weeklyResetPath: current?.weeklyResetPath ?? "quota.weekly.reset_at",
+        balanceRemainingPath: current?.balanceRemainingPath ?? "balance.remaining",
+        currencyPath: current?.currencyPath ?? "balance.currency"
+      }),
+      ignoreFocusOut: true
+    });
+    if (!mappingInput?.trim()) return;
+    try {
+      configuration = normalizeUsageConfiguration({ endpoint, ...JSON.parse(mappingInput) }) ?? { endpoint };
+    } catch {
+      vscode.window.showErrorMessage("额度字段路径必须是有效的 JSON 对象。");
+      return;
+    }
+  }
+  await updateProviderUsageConfiguration(selected, configuration);
+  const refresh = await vscode.window.showInformationMessage(
+    `已保存“${selected.provider.name}”的额度 API。是否立即测试？`,
+    "立即测试"
+  );
+  if (refresh === "立即测试") await refreshSelectedProviderUsage(selected, context);
+}
+
+async function manageProviderUsage(context: vscode.ExtensionContext): Promise<void> {
+  type ConfiguredProvider = UsageProviderSelection;
+  type UsageManagementItem = {
+    label: string;
+    description: string;
+    detail: string;
+    item?: ConfiguredProvider;
+  };
+  while (true) {
+    const configured: ConfiguredProvider[] = [
+      ...getGateways()
+        .filter((provider) => provider.usage)
+        .map((provider) => ({ kind: "claude" as const, provider })),
+      ...getCodexProviders()
+        .filter((provider) => provider.usage)
+        .map((provider) => ({ kind: "codex" as const, provider }))
+    ];
+    const items: UsageManagementItem[] = configured.map((item) => ({
+      label: `${item.kind === "claude" ? "Claude" : "Codex"} · ${item.provider.name}`,
+      description: formatUsageConfigurationDescription(item.provider.usage),
+      detail: "选择后可查看、修改、测试或删除额度 API 配置",
+      item
+    }));
+    items.push({
+      label: "$(add) 配置新的 Provider 额度 API",
+      description: "为尚未配置额度 API 的自定义 Provider 添加配置",
+      detail: "",
+      item: undefined
+    });
+    const selected = await vscode.window.showQuickPick(items, {
+      title: "管理 Provider 用量与额度配置",
+      placeHolder: configured.length ? "选择已有配置查看或管理" : "当前还没有额度 API 配置"
+    });
+    if (!selected) return;
+    if (!selected.item) {
+      await configureProviderUsage(context);
+      continue;
+    }
+
+    const provider = selected.item.provider;
+    const usage = provider.usage;
+    if (!usage) continue;
+    const action = await vscode.window.showQuickPick([
+      {
+        label: "查看配置详情",
+        description: formatUsageConfigurationDescription(usage),
+        action: "view"
+      },
+      {
+        label: "修改额度配置",
+        description: "更新接口地址或 JSON 字段路径",
+        action: "edit"
+      },
+      {
+        label: "测试并刷新额度",
+        description: "使用该 Provider 已保存的凭据调用额度 API",
+        action: "test"
+      },
+      {
+        label: "删除额度 API 配置",
+        description: "删除配置并保留已有额度快照",
+        action: "delete"
+      }
+    ], { title: `${provider.name} · 额度配置管理` });
+    if (!action) continue;
+    if (action.action === "view") {
+      await showProviderUsageDetails(selected.item);
+    } else if (action.action === "edit") {
+      await configureProviderUsageForSelection(context, selected.item);
+    } else if (action.action === "test") {
+      await refreshSelectedProviderUsage(selected.item, context);
+    } else if (action.action === "delete") {
+      const confirm = await vscode.window.showWarningMessage(
+        `确定删除“${provider.name}”的额度 API 配置？已有额度快照不会删除。`,
+        { modal: true },
+        "删除配置"
+      );
+      if (confirm === "删除配置") {
+        await updateProviderUsageConfiguration(selected.item, undefined);
+        vscode.window.showInformationMessage(`已删除“${provider.name}”的额度 API 配置。`);
+      }
+    }
+  }
+}
+
+function formatUsageConfigurationDescription(usage: ProviderUsageConfiguration | undefined): string {
+  if (!usage) return "未配置";
+  const pathCount = [
+    usage.balanceRemainingPath, usage.balanceUsedPath, usage.currencyPath,
+    usage.fiveHourUsedPercentPath, usage.fiveHourRemainingPercentPath, usage.fiveHourResetPath,
+    usage.weeklyUsedPercentPath, usage.weeklyRemainingPercentPath, usage.weeklyResetPath
+  ].filter(Boolean).length;
+  return `${usage.endpoint} · ${pathCount} 个字段映射`;
+}
+
+async function showProviderUsageDetails(
+  selected: UsageProviderSelection
+): Promise<void> {
+  const usage = selected.provider.usage;
+  if (!usage) return;
+  const snapshot = getProviderUsageSnapshots().find((entry) =>
+    entry.providerId === selected.provider.id && entry.providerKind === selected.kind
+  );
+  const fields = [
+    ["额度 API", usage.endpoint],
+    ["余额剩余路径", usage.balanceRemainingPath],
+    ["余额已用路径", usage.balanceUsedPath],
+    ["货币路径", usage.currencyPath],
+    ["5 小时已用比例路径", usage.fiveHourUsedPercentPath],
+    ["5 小时剩余比例路径", usage.fiveHourRemainingPercentPath],
+    ["5 小时重置路径", usage.fiveHourResetPath],
+    ["周已用比例路径", usage.weeklyUsedPercentPath],
+    ["周剩余比例路径", usage.weeklyRemainingPercentPath],
+    ["周重置路径", usage.weeklyResetPath]
+  ];
+  const detail = fields
+    .filter(([, value]) => value)
+    .map(([label, value]) => `${label}：${value}`)
+    .join("\n");
+  const snapshotText = snapshot
+    ? `\n\n最近快照：${formatProviderUsageSummary(snapshot)}\n更新时间：${snapshot.fetchedAt}\n来源：${snapshot.source === "usageApi" ? "额度 API" : "模型接口响应头"}`
+    : "\n\n最近快照：尚未刷新";
+  await vscode.window.showInformationMessage(`${selected.provider.name} 的额度配置\n\n${detail}${snapshotText}`, { modal: true }, "关闭");
+}
+
+async function configureProviderUsageForSelection(
+  context: vscode.ExtensionContext,
+  selected: UsageProviderSelection
+): Promise<void> {
+  const current = selected.provider.usage;
+  if (!current) {
+    await configureProviderUsage(context, selected);
+    return;
+  }
+  const endpointInput = await vscode.window.showInputBox({
+    title: `${selected.provider.name} · 修改额度 API 地址`,
+    prompt: "修改后将替换当前配置。优先使用 HTTPS 和只读凭据。",
+    value: current.endpoint,
+    ignoreFocusOut: true
+  });
+  if (!endpointInput?.trim()) return;
+  let endpoint: string;
+  try {
+    endpoint = validateUsageEndpoint(endpointInput);
+  } catch (error) {
+    vscode.window.showErrorMessage(error instanceof Error ? error.message : "额度 API 地址无效");
+    return;
+  }
+  if (endpoint.startsWith("http://")) {
+    const confirm = await vscode.window.showWarningMessage(
+      "修改后的额度 API 使用 HTTP，Provider Key 和账户用量数据缺少 TLS 保护。是否仍然保存？",
+      { modal: true },
+      "仍然保存"
+    );
+    if (confirm !== "仍然保存") return;
+  }
+  const mappingInput = await vscode.window.showInputBox({
+    title: `${selected.provider.name} · 修改 JSON 字段路径`,
+    prompt: "输入 JSON 对象；输入 {} 可清除字段映射并恢复自动识别。",
+    value: JSON.stringify({
+      balanceRemainingPath: current.balanceRemainingPath,
+      balanceUsedPath: current.balanceUsedPath,
+      currencyPath: current.currencyPath,
+      fiveHourUsedPercentPath: current.fiveHourUsedPercentPath,
+      fiveHourRemainingPercentPath: current.fiveHourRemainingPercentPath,
+      fiveHourResetPath: current.fiveHourResetPath,
+      weeklyUsedPercentPath: current.weeklyUsedPercentPath,
+      weeklyRemainingPercentPath: current.weeklyRemainingPercentPath,
+      weeklyResetPath: current.weeklyResetPath
+    }, null, 2),
+    ignoreFocusOut: true
+  });
+  if (!mappingInput?.trim()) return;
+  let mapping: Record<string, unknown>;
+  try {
+    mapping = JSON.parse(mappingInput) as Record<string, unknown>;
+    if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) throw new Error();
+  } catch {
+    vscode.window.showErrorMessage("额度字段路径必须是有效的 JSON 对象。");
+    return;
+  }
+  const updated = normalizeUsageConfiguration({ endpoint, ...mapping });
+  if (!updated) {
+    vscode.window.showErrorMessage("无法保存额度配置，请检查额度 API 地址。");
+    return;
+  }
+  await updateProviderUsageConfiguration(selected, updated);
+  vscode.window.showInformationMessage(`已更新“${selected.provider.name}”的额度 API 配置。`);
+  const test = await vscode.window.showInformationMessage("是否立即测试更新后的额度配置？", "立即测试");
+  if (test === "立即测试") await refreshSelectedProviderUsage(selected, context);
+}
+
+async function updateProviderUsageConfiguration(
+  selected: UsageProviderSelection,
+  usage: ProviderUsageConfiguration | undefined
+): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  if (selected.kind === "claude") {
+    await settings.update("gateways", getGateways().map((provider) =>
+      provider.id === selected.provider.id ? { ...provider, usage } : provider
+    ), vscode.ConfigurationTarget.Global);
+  } else {
+    await settings.update(CODEX_PROVIDERS_KEY, getCodexProviders().map((provider) =>
+      provider.id === selected.provider.id ? { ...provider, usage } : provider
+    ), vscode.ConfigurationTarget.Global);
+  }
+}
+
+async function deleteProviderUsageConfiguration(selected: UsageProviderSelection): Promise<void> {
+  const confirm = await vscode.window.showWarningMessage(
+    `确定删除“${selected.provider.name}”的额度 API 配置？已有额度快照会保留。`,
+    { modal: true },
+    "删除配置"
+  );
+  if (confirm !== "删除配置") return;
+  await updateProviderUsageConfiguration(selected, undefined);
+  vscode.window.showInformationMessage(`已删除“${selected.provider.name}”的额度 API 配置。`);
+}
+
+async function refreshProviderUsage(context: vscode.ExtensionContext): Promise<void> {
+  const selected = await pickUsageProvider("刷新 Provider 用量与额度");
+  if (!selected) return;
+  await refreshSelectedProviderUsage(selected, context);
+}
+
+async function refreshSelectedProviderUsage(
+  selected: UsageProviderSelection,
+  context?: vscode.ExtensionContext
+): Promise<void> {
+  if (!context) {
+    vscode.window.showWarningMessage("请通过命令面板的“Refresh Provider Usage”执行首次测试。");
+    return;
+  }
+  const token = selected.kind === "claude"
+    ? await getStoredGatewayToken(context, selected.provider as GatewayProfile)
+    : await getStoredCodexApiKey(context, selected.provider as CodexProviderProfile);
+  if (!token) {
+    vscode.window.showWarningMessage(`“${selected.provider.name}”尚未保存凭据，请先切换到该 Provider 一次。`);
+    return;
+  }
+  try {
+    let snapshot: ProviderUsageSnapshot;
+    if (selected.provider.usage) {
+      snapshot = await requestProviderUsage(
+        selected.provider.usage.endpoint,
+        token,
+        selected.provider.id,
+        selected.kind,
+        selected.provider.usage
+      );
+    } else if (selected.kind === "claude") {
+      const response = await requestGatewayModels(selected.provider.baseUrl, token);
+      await saveGatewayModels(selected.provider.id, response.models);
+      snapshot = parseProviderUsage(selected.provider.id, "claude", "", response.headers);
+    } else {
+      const response = await requestCodexModels(selected.provider.baseUrl, token);
+      await saveCodexModels(selected.provider.id, response.models);
+      snapshot = parseProviderUsage(selected.provider.id, "codex", "", response.headers);
+    }
+    await saveProviderUsageSnapshot(snapshot);
+    if (!hasProviderUsage(snapshot)) {
+      const configure = await vscode.window.showWarningMessage(
+        `“${selected.provider.name}”的模型接口没有返回可识别的限流头。可配置服务商提供的只读额度 API。`,
+        "配置额度 API"
+      );
+      if (configure === "配置额度 API") await configureProviderUsage(context);
+      return;
+    }
+    vscode.window.showInformationMessage(
+      `${selected.provider.name}：${formatProviderUsageSummary(snapshot)}。数据来源：${snapshot.source === "usageApi" ? "额度 API" : "模型接口响应头"}。`
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    const diagnostic = classifyUsageError(message);
+    vscode.window.showErrorMessage(`刷新“${selected.provider.name}”额度失败：${diagnostic}`);
+  }
+}
+
+function classifyUsageError(message: string): string {
+  if (/不是有效 JSON|HTML|DOCTYPE/i.test(message)) {
+    return `${message}。该地址可能返回了登录页、反向代理错误页，或不是实际的额度接口；请在“管理额度配置”中检查 endpoint。`;
+  }
+  if (/401|403|unauthorized|forbidden/i.test(message)) {
+    return `${message}。额度接口拒绝了当前 Provider Key；如果是 Sub2API 的 /user/platform-quotas，需要单独的用户 JWT，不能直接使用模型 API Key。`;
+  }
+  return message;
+}
+
+async function saveUsageFromResponseHeaders(
+  providerKind: "claude" | "codex",
+  providerId: string,
+  headers: IncomingHttpHeaders
+): Promise<void> {
+  const snapshot = parseProviderUsage(providerId, providerKind, "", headers);
+  if (hasProviderUsage(snapshot)) await saveProviderUsageSnapshot(snapshot);
+}
+
+async function saveProviderUsageSnapshot(snapshot: ProviderUsageSnapshot): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const existing = getProviderUsageSnapshots().filter((entry) =>
+    entry.providerId !== snapshot.providerId || entry.providerKind !== snapshot.providerKind
+  );
+  existing.push(snapshot);
+  await settings.update(PROVIDER_USAGE_SNAPSHOTS_KEY, existing, vscode.ConfigurationTarget.Global);
+}
+
+function getProviderUsageSnapshots(): ProviderUsageSnapshot[] {
+  const raw = vscode.workspace.getConfiguration("aiProviderSwitcher").get<unknown>(PROVIDER_USAGE_SNAPSHOTS_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((item): item is ProviderUsageSnapshot => {
+    if (!item || typeof item !== "object") return false;
+    const snapshot = item as Partial<ProviderUsageSnapshot>;
+    return Boolean(snapshot.providerId && (snapshot.providerKind === "claude" || snapshot.providerKind === "codex"));
+  });
+}
+
 function getCodexProviders(): CodexProviderProfile[] {
   const raw = vscode.workspace
     .getConfiguration("aiProviderSwitcher")
@@ -1621,7 +2160,8 @@ function getCodexProviders(): CodexProviderProfile[] {
     .map((item) => ({
       id: String(item.id ?? "").trim(),
       name: String(item.name ?? "").trim(),
-      baseUrl: normalizeProviderRootUrl(String(item.baseUrl ?? "").trim())
+      baseUrl: normalizeProviderRootUrl(String(item.baseUrl ?? "").trim()),
+      usage: normalizeUsageConfiguration(item.usage)
     }))
     .filter((provider) => provider.id && provider.name && provider.baseUrl);
 }
@@ -1687,9 +2227,317 @@ async function writeCodexConfigurationFile(content: string): Promise<void> {
   await fs.writeFile(CODEX_CONFIG_FILE, content, "utf8");
 }
 
+async function writeCodexEnvFile(proxyUrl: string): Promise<void> {
+  const content = await readCodexEnvFile();
+  await fs.mkdir(path.dirname(CODEX_ENV_FILE), { recursive: true });
+  await fs.writeFile(CODEX_ENV_FILE, updateManagedCodexEnv(content, proxyUrl), "utf8");
+}
+
+async function readCodexEnvFile(): Promise<string> {
+  try {
+    return await fs.readFile(CODEX_ENV_FILE, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return "";
+    throw error;
+  }
+}
+
+async function removeCodexProxyEnvironment(): Promise<void> {
+  const content = await readCodexEnvFile();
+  if (!content) return;
+  const updated = removeManagedCodexEnv(content);
+  if (updated) {
+    await fs.writeFile(CODEX_ENV_FILE, `${updated}\n`, "utf8");
+    return;
+  }
+  await fs.unlink(CODEX_ENV_FILE);
+}
+
+async function configureCodexProxy(): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const configuredProxy = settings.get<string>(CODEX_PROXY_URL_KEY, "");
+  const proxyMode = settings.get<CodexProxyMode>(CODEX_PROXY_MODE_KEY, "officialOnly");
+  const detectedProxy = await detectCodexProxyUrl();
+  const envContent = await readCodexEnvFile();
+  const unmanagedEntries = findUnmanagedCodexProxyEnv(envContent);
+  const scopeLabel = proxyMode === "officialOnly" ? "仅官方服务" : "官方及所有中转站";
+  const action = await vscode.window.showQuickPick(
+    [
+      {
+        label: "$(search) 自动检测并应用当前设备代理",
+        description: detectedProxy ?? "未检测到 HTTP(S) 系统代理，可改用手动输入",
+        action: "detect"
+      },
+      {
+        label: "$(edit) 设置或更新代理",
+        description: configuredProxy || "手动输入当前设备实际地址和端口",
+        action: "set"
+      },
+      {
+        label: "$(settings) 设置代理作用范围",
+        description: `当前：${scopeLabel}`,
+        action: "scope"
+      },
+      {
+        label: "$(warning) 检查 .env 代理冲突",
+        description: unmanagedEntries.length > 0
+          ? `发现 ${unmanagedEntries.length} 个非本插件管理的代理变量`
+          : "未发现非本插件管理的代理变量",
+        action: "inspect"
+      },
+      {
+        label: "$(trash) 停用插件管理的代理",
+        description: "只移除插件写入的配置，保留 .env 中其他内容",
+        action: "disable"
+      }
+    ],
+    {
+      title: "配置 Codex WebSocket 代理",
+      placeHolder: "同时适用于 Codex 官方服务和自定义 Provider"
+    }
+  );
+  if (!action) return;
+
+  try {
+    if (action.action === "inspect") {
+      await inspectCodexEnvProxyConflicts(envContent, unmanagedEntries);
+      return;
+    }
+    if (action.action === "scope") {
+      const selected = await vscode.window.showQuickPick(
+        [
+          {
+            label: "仅官方 OpenAI 服务（推荐）",
+            description: "切换到中转站时暂停插件管理的代理，避免改变中转站网络路径",
+            mode: "officialOnly" as const
+          },
+          {
+            label: "官方服务及所有中转站",
+            description: "中转站自身也必须通过本机代理访问时使用",
+            mode: "allProviders" as const
+          }
+        ],
+        { title: "选择 Codex 代理作用范围" }
+      );
+      if (!selected) return;
+      await settings.update(CODEX_PROXY_MODE_KEY, selected.mode, vscode.ConfigurationTarget.Global);
+      await synchronizeCodexProxyForProvider(settings);
+      await offerReload(`Codex 代理作用范围已设为“${selected.label}”。是否立即重载 VS Code？`);
+      return;
+    }
+    if (action.action === "detect") {
+      if (!detectedProxy) {
+        vscode.window.showWarningMessage(
+          "未检测到当前设备的 HTTP(S) 代理。请确认系统代理已启用，或选择“设置或更新代理”手动填写。"
+        );
+        return;
+      }
+      if (!await confirmCodexEnvProxyConflicts(envContent, unmanagedEntries)) return;
+      await applyCodexProxy(settings, detectedProxy, proxyMode);
+      return;
+    }
+    if (action.action === "set") {
+      const entered = await vscode.window.showInputBox({
+        title: "配置 Codex 代理地址",
+        prompt: "输入代理地址，例如 http://127.0.0.1:7890（Clash）或 http://127.0.0.1:10808（v2rayN）",
+        placeHolder: "http://127.0.0.1:<当前设备端口>",
+        value: configuredProxy || detectedProxy || "http://127.0.0.1:",
+        ignoreFocusOut: true
+      });
+      if (!entered?.trim()) return;
+      const proxyUrl = normalizeCodexProxyUrl(entered);
+      if (!await confirmCodexEnvProxyConflicts(envContent, unmanagedEntries)) return;
+      await applyCodexProxy(settings, proxyUrl, proxyMode);
+      return;
+    }
+    await removeCodexProxyEnvironment();
+    await settings.update(CODEX_PROXY_URL_KEY, "", vscode.ConfigurationTarget.Global);
+    await offerReload("插件管理的 Codex 代理已停用。需要重新加载 VS Code 以重启 Codex 后台进程，是否立即重载？");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    vscode.window.showErrorMessage(`配置 Codex 代理失败：${message}`);
+  }
+}
+
+async function applyCodexProxy(
+  settings: vscode.WorkspaceConfiguration,
+  proxyUrl: string,
+  proxyMode: CodexProxyMode
+): Promise<void> {
+  await settings.update(CODEX_PROXY_URL_KEY, proxyUrl, vscode.ConfigurationTarget.Global);
+  await synchronizeCodexProxyForProvider(settings, proxyUrl, proxyMode);
+  const activeProvider = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  const paused = proxyMode === "officialOnly" && Boolean(activeProvider);
+  await offerReload(
+    paused
+      ? `Codex 代理已保存为 ${proxyUrl}，当前使用中转站，按“仅官方服务”范围暂不写入。是否立即重载 VS Code？`
+      : `Codex WebSocket 代理已配置为 ${proxyUrl}。需要重新加载 VS Code 以重启 Codex 后台进程，是否立即重载？`
+  );
+}
+
+async function synchronizeCodexProxyForProvider(
+  settings: vscode.WorkspaceConfiguration,
+  proxyUrl = settings.get<string>(CODEX_PROXY_URL_KEY, ""),
+  proxyMode = settings.get<CodexProxyMode>(CODEX_PROXY_MODE_KEY, "officialOnly")
+): Promise<void> {
+  const activeProvider = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  if (!proxyUrl || (proxyMode === "officialOnly" && activeProvider)) {
+    await removeCodexProxyEnvironment();
+    return;
+  }
+  await writeCodexEnvFile(proxyUrl);
+}
+
+async function confirmCodexEnvProxyConflicts(
+  content: string,
+  entries: ReturnType<typeof findUnmanagedCodexProxyEnv>
+): Promise<boolean> {
+  if (entries.length === 0) return true;
+  const choice = await vscode.window.showWarningMessage(
+    `检测到 ~/.codex/.env 已有 ${entries.length} 个非本插件管理的代理变量。重复变量的生效顺序可能因 Codex 的 dotenv 解析方式而异，建议先处理冲突。`,
+    { modal: true },
+    "查看并处理",
+    "保留并继续",
+    "取消"
+  );
+  if (choice === "查看并处理") {
+    await inspectCodexEnvProxyConflicts(content, entries);
+    return false;
+  }
+  return choice === "保留并继续";
+}
+
+async function inspectCodexEnvProxyConflicts(
+  content: string,
+  entries = findUnmanagedCodexProxyEnv(content)
+): Promise<void> {
+  if (entries.length === 0) {
+    vscode.window.showInformationMessage("~/.codex/.env 中未发现非本插件管理的代理变量。");
+    return;
+  }
+  const detail = entries.map((entry) => `${entry.name}（第 ${entry.line} 行）=${entry.value}`).join("；");
+  const choice = await vscode.window.showWarningMessage(
+    `发现已有代理变量：${detail}`,
+    { modal: true },
+    "移除这些变量并由插件管理",
+    "保留",
+    "取消"
+  );
+  if (choice !== "移除这些变量并由插件管理") return;
+  const updated = removeUnmanagedCodexProxyEnv(content);
+  if (updated) {
+    await fs.writeFile(CODEX_ENV_FILE, updated.endsWith("\n") ? updated : `${updated}\n`, "utf8");
+  } else {
+    await fs.unlink(CODEX_ENV_FILE);
+  }
+  vscode.window.showInformationMessage("已移除 ~/.codex/.env 中原有的代理变量，其他内容已保留。");
+}
+
+async function detectCodexProxyUrl(): Promise<string | undefined> {
+  for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) {
+    const value = process.env[name]?.trim();
+    if (!value) continue;
+    try {
+      return normalizeCodexProxyUrl(value);
+    } catch {
+      // Continue to the operating-system proxy configuration.
+    }
+  }
+  const vscodeProxy = vscode.workspace.getConfiguration("http").get<string>("proxy", "").trim();
+  if (vscodeProxy) {
+    try {
+      return normalizeCodexProxyUrl(vscodeProxy);
+    } catch {
+      // Continue to the operating-system proxy configuration.
+    }
+  }
+  if (process.platform === "win32") return queryWindowsInternetProxy();
+  if (process.platform === "darwin") return queryMacOsInternetProxy();
+  if (process.platform === "linux") return queryGnomeInternetProxy();
+  return undefined;
+}
+
+async function queryMacOsInternetProxy(): Promise<string | undefined> {
+  const output = await collectProcessOutput("scutil", ["--proxy"]);
+  if (!output) return undefined;
+  try {
+    return parseMacOsProxySettings(output);
+  } catch {
+    return undefined;
+  }
+}
+
+async function queryGnomeInternetProxy(): Promise<string | undefined> {
+  const mode = (await collectProcessOutput("gsettings", [
+    "get", "org.gnome.system.proxy", "mode"
+  ]))?.replace(/[\s']/g, "");
+  if (mode !== "manual") return undefined;
+  for (const protocol of ["https", "http"]) {
+    const host = (await collectProcessOutput("gsettings", [
+      "get", `org.gnome.system.proxy.${protocol}`, "host"
+    ]))?.trim().replace(/^['"]|['"]$/g, "");
+    const port = (await collectProcessOutput("gsettings", [
+      "get", `org.gnome.system.proxy.${protocol}`, "port"
+    ]))?.trim();
+    if (host && port && /^\d+$/.test(port)) {
+      try {
+        return normalizeCodexProxyUrl(`http://${host}:${port}`);
+      } catch {
+        // Try the next protocol.
+      }
+    }
+  }
+  return undefined;
+}
+
+function collectProcessOutput(command: string, args: string[]): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args);
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      output += chunk;
+    });
+    child.on("error", () => resolve(undefined));
+    child.on("close", (code) => resolve(code === 0 ? output : undefined));
+  });
+}
+
+function queryWindowsInternetProxy(): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const child = spawn("reg.exe", [
+      "query",
+      "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"
+    ]);
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      output += chunk;
+    });
+    child.on("error", () => resolve(undefined));
+    child.on("close", (code) => {
+      if (code !== 0 || !/^\s*ProxyEnable\s+REG_DWORD\s+0x1\s*$/im.test(output)) {
+        resolve(undefined);
+        return;
+      }
+      const proxyServer = output.match(/^\s*ProxyServer\s+REG_SZ\s+(.+?)\s*$/im)?.[1];
+      if (!proxyServer) {
+        resolve(undefined);
+        return;
+      }
+      try {
+        resolve(parseWindowsProxyServer(proxyServer));
+      } catch {
+        resolve(undefined);
+      }
+    });
+  });
+}
+
 function serializeManagedCodexProviders(providers: CodexProviderProfile[]): string {
   const providerBlocks = providers.map((provider) => {
     const keyFile = getCodexApiKeyFile(provider);
+    const auth = createCodexAuthConfig(process.platform, CODEX_AUTH_HELPER_FILE, keyFile);
     return [
       `[model_providers.${JSON.stringify(provider.id)}]`,
       `name = ${JSON.stringify(provider.name)}`,
@@ -1697,22 +2545,34 @@ function serializeManagedCodexProviders(providers: CodexProviderProfile[]): stri
       `wire_api = "responses"`,
       ``,
       `[model_providers.${JSON.stringify(provider.id)}.auth]`,
-      `command = "powershell.exe"`,
-      `args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", ${JSON.stringify(
-        CODEX_AUTH_HELPER_FILE
-      )}, ${JSON.stringify(keyFile)}]`
+      `command = ${JSON.stringify(auth.command)}`,
+      `args = [${auth.args.map((argument) => JSON.stringify(argument)).join(", ")}]`
     ].join("\n");
   });
   return [CODEX_MANAGED_BEGIN, ...providerBlocks, CODEX_MANAGED_END].join("\n");
 }
 
-const CODEX_AUTH_HELPER_FILE = path.join(os.homedir(), ".codex", "ai-provider-switcher-codex-auth.ps1");
+const CODEX_AUTH_HELPER_FILE = path.join(
+  os.homedir(),
+  ".codex",
+  process.platform === "win32"
+    ? "ai-provider-switcher-codex-auth.ps1"
+    : "ai-provider-switcher-codex-auth.sh"
+);
 
 async function ensureCodexAuthHelper(): Promise<void> {
-  if (process.platform !== "win32") {
-    throw new Error("当前 Codex 密钥安全桥接实现只支持 Windows。");
-  }
   await fs.mkdir(path.dirname(CODEX_AUTH_HELPER_FILE), { recursive: true });
+  if (process.platform !== "win32") {
+    const helper = [
+      "#!/bin/sh",
+      "set -eu",
+      "if [ \"$#\" -ne 1 ]; then exit 2; fi",
+      "exec /bin/cat -- \"$1\""
+    ].join("\n") + "\n";
+    await fs.writeFile(CODEX_AUTH_HELPER_FILE, helper, { encoding: "utf8", mode: 0o700 });
+    await fs.chmod(CODEX_AUTH_HELPER_FILE, 0o700);
+    return;
+  }
   const helper = [
     "$ErrorActionPreference = 'Stop'",
     "$encrypted = (Get-Content -Raw -LiteralPath $args[0]).Trim()",
@@ -1727,6 +2587,12 @@ async function ensureCodexAuthHelper(): Promise<void> {
 async function writeCodexApiKeyFile(provider: CodexProviderProfile, apiKey: string): Promise<void> {
   await ensureCodexAuthHelper();
   const keyFile = getCodexApiKeyFile(provider);
+  if (process.platform !== "win32") {
+    await fs.mkdir(path.dirname(keyFile), { recursive: true, mode: 0o700 });
+    await fs.writeFile(keyFile, `${apiKey}\n`, { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(keyFile, 0o600);
+    return;
+  }
   await fs.mkdir(path.dirname(keyFile), { recursive: true });
   const escapedPath = keyFile.replace(/'/g, "''");
   const command =
@@ -1789,7 +2655,8 @@ function getGateways(): GatewayProfile[] {
         baseUrl,
         modelMapping: normalizeClaudeModelMapping(item.modelMapping) ??
           (isDeepSeekAnthropicApi(baseUrl) ? getDeepSeekClaudeModelMapping() : undefined),
-        permissionStrategy: normalizeClaudePermissionStrategy(item.permissionStrategy)
+        permissionStrategy: normalizeClaudePermissionStrategy(item.permissionStrategy),
+        usage: normalizeUsageConfiguration(item.usage)
       };
     })
     .filter((gateway) => gateway.id && gateway.name && gateway.baseUrl);

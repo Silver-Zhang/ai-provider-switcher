@@ -31,7 +31,7 @@
     "ai"
   ],
   "galleryBanner": {
-    "color": "#1f2937",
+    "color": "#0b1026",
     "theme": "dark"
   },
   "pricing": "Free",
@@ -131,6 +131,18 @@
       {
         "command": "aiProviderSwitcher.showCodexModels",
         "title": "AI Provider Switcher: Show Codex Models"
+      },
+      {
+        "command": "aiProviderSwitcher.configureCodexProxy",
+        "title": "AI Provider Switcher: Configure Codex WebSocket Proxy"
+      },
+      {
+        "command": "aiProviderSwitcher.refreshProviderUsage",
+        "title": "AI Provider Switcher: Refresh Provider Usage"
+      },
+      {
+        "command": "aiProviderSwitcher.configureProviderUsage",
+        "title": "AI Provider Switcher: Configure Provider Usage API"
       }
     ],
     "configuration": {
@@ -182,23 +194,54 @@
                   "subagentModel"
                 ],
                 "properties": {
-                  "mainModel": { "type": "string" },
-                  "fableModel": { "type": "string" },
-                  "opusModel": { "type": "string" },
-                  "sonnetModel": { "type": "string" },
-                  "haikuModel": { "type": "string" },
-                  "subagentModel": { "type": "string" },
-                  "supports1m": { "type": "boolean", "default": false },
+                  "mainModel": {
+                    "type": "string"
+                  },
+                  "fableModel": {
+                    "type": "string"
+                  },
+                  "opusModel": {
+                    "type": "string"
+                  },
+                  "sonnetModel": {
+                    "type": "string"
+                  },
+                  "haikuModel": {
+                    "type": "string"
+                  },
+                  "subagentModel": {
+                    "type": "string"
+                  },
+                  "supports1m": {
+                    "type": "boolean",
+                    "default": false
+                  },
                   "effortLevel": {
                     "type": "string",
-                    "enum": ["auto", "low", "medium", "high", "xhigh", "max"]
+                    "enum": [
+                      "auto",
+                      "low",
+                      "medium",
+                      "high",
+                      "xhigh",
+                      "max"
+                    ]
                   }
                 }
               },
               "permissionStrategy": {
                 "type": "string",
-                "enum": ["auto", "acceptEdits", "manual", "bypassPermissions"],
+                "enum": [
+                  "auto",
+                  "acceptEdits",
+                  "manual",
+                  "bypassPermissions"
+                ],
                 "description": "Command execution strategy applied when this Claude provider becomes active."
+              },
+              "usage": {
+                "$ref": "#/contributes/configuration/properties/aiProviderSwitcher.codexProviders/items/properties/usage",
+                "description": "Optional read-only JSON usage API configuration."
               }
             }
           },
@@ -255,6 +298,45 @@
               },
               "baseUrl": {
                 "type": "string"
+              },
+              "usage": {
+                "type": "object",
+                "description": "Optional read-only JSON usage API configuration.",
+                "required": [
+                  "endpoint"
+                ],
+                "properties": {
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "balanceRemainingPath": {
+                    "type": "string"
+                  },
+                  "balanceUsedPath": {
+                    "type": "string"
+                  },
+                  "currencyPath": {
+                    "type": "string"
+                  },
+                  "fiveHourUsedPercentPath": {
+                    "type": "string"
+                  },
+                  "fiveHourRemainingPercentPath": {
+                    "type": "string"
+                  },
+                  "fiveHourResetPath": {
+                    "type": "string"
+                  },
+                  "weeklyUsedPercentPath": {
+                    "type": "string"
+                  },
+                  "weeklyRemainingPercentPath": {
+                    "type": "string"
+                  },
+                  "weeklyResetPath": {
+                    "type": "string"
+                  }
+                }
               }
             }
           },
@@ -296,6 +378,31 @@
           "type": "string",
           "default": "",
           "description": "Currently selected Codex model."
+        },
+        "aiProviderSwitcher.providerUsageSnapshots": {
+          "type": "array",
+          "default": [],
+          "description": "Cached non-secret usage, balance, quota-window, and rate-limit snapshots for custom providers."
+        },
+        "aiProviderSwitcher.codexProxyUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "HTTP(S) proxy address managed by the Configure Codex WebSocket Proxy command. The extension preserves unrelated ~/.codex/.env entries."
+        },
+        "aiProviderSwitcher.codexProxyMode": {
+          "type": "string",
+          "enum": [
+            "officialOnly",
+            "allProviders"
+          ],
+          "enumDescriptions": [
+            "Apply the managed proxy only while using the official OpenAI provider.",
+            "Apply the managed proxy while using both official and custom Codex providers."
+          ],
+          "default": "officialOnly",
+          "scope": "machine",
+          "description": "Controls whether the managed Codex proxy is active only for the official provider or for all providers."
         }
       }
     }
@@ -310,6 +417,7 @@
     "@types/node": "^20.14.12",
     "@types/vscode": "^1.90.0",
     "@vscode/vsce": "^3.9.2",
+    "sharp": "^0.35.3",
     "typescript": "^5.5.4"
   }
 }

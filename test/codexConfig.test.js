@@ -3,13 +3,36 @@ const test = require("node:test");
 const {
   CODEX_MANAGED_BEGIN,
   CODEX_MANAGED_END,
+  createCodexAuthConfig,
   createCodexModelCatalog,
+  findUnmanagedCodexProxyEnv,
   getCodexApiBaseUrl,
+  normalizeCodexProxyUrl,
   normalizeProviderRootUrl,
+  parseMacOsProxySettings,
+  parseWindowsProxyServer,
   parseTopLevelTomlString,
+  removeManagedCodexEnv,
   removeManagedCodexProviders,
+  removeUnmanagedCodexProxyEnv,
+  updateManagedCodexEnv,
   updateTopLevelTomlKey
 } = require("../out/codexConfig.js");
+
+test("creates platform-specific Codex auth commands", () => {
+  assert.deepEqual(createCodexAuthConfig("win32", "C:\\Users\\me\\.codex\\auth.ps1", "C:\\Users\\me\\.codex\\key"), {
+    command: "powershell.exe",
+    args: ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "C:\\Users\\me\\.codex\\auth.ps1", "C:\\Users\\me\\.codex\\key"]
+  });
+  assert.deepEqual(createCodexAuthConfig("darwin", "/Users/me/.codex/auth.sh", "/Users/me/.codex/key"), {
+    command: "/Users/me/.codex/auth.sh",
+    args: ["/Users/me/.codex/key"]
+  });
+  assert.deepEqual(createCodexAuthConfig("linux", "/home/me/.codex/auth.sh", "/home/me/.codex/key"), {
+    command: "/home/me/.codex/auth.sh",
+    args: ["/home/me/.codex/key"]
+  });
+});
 
 test("stores provider roots and derives the Codex API base URL", () => {
   assert.equal(normalizeProviderRootUrl("https://api.example.com"), "https://api.example.com");
@@ -77,4 +100,56 @@ test("documents trimming encrypted key files before DPAPI decryption", () => {
     "utf8"
   );
   assert.match(extensionSource, /Get-Content -Raw -LiteralPath \$args\[0\]\)\.Trim\(\)/);
+});
+
+test("validates and normalizes Codex proxy URLs", () => {
+  assert.equal(normalizeCodexProxyUrl(" http://127.0.0.1:4780 "), "http://127.0.0.1:4780");
+  assert.equal(normalizeCodexProxyUrl("https://proxy.example.com:8443"), "https://proxy.example.com:8443");
+  assert.throws(() => normalizeCodexProxyUrl("socks5://127.0.0.1:1080"), /http:\/\/ 或 https:\/\//);
+  assert.throws(() => normalizeCodexProxyUrl("http://127.0.0.1:4780/path"), /不能包含路径/);
+});
+
+test("updates only the managed Codex proxy environment block", () => {
+  const original = 'CUSTOM_SETTING="keep-me"\n';
+  const configured = updateManagedCodexEnv(original, "http://127.0.0.1:4780");
+  assert.match(configured, /CUSTOM_SETTING="keep-me"/);
+  assert.match(configured, /HTTP_PROXY="http:\/\/127\.0\.0\.1:4780"/);
+  assert.match(configured, /HTTPS_PROXY="http:\/\/127\.0\.0\.1:4780"/);
+  const updated = updateManagedCodexEnv(configured, "http://127.0.0.1:7890");
+  assert.doesNotMatch(updated, /4780/);
+  assert.match(updated, /CUSTOM_SETTING="keep-me"/);
+  assert.equal(removeManagedCodexEnv(updated), 'CUSTOM_SETTING="keep-me"');
+});
+
+test("parses Windows system proxy formats without assuming a fixed port", () => {
+  assert.equal(parseWindowsProxyServer("127.0.0.1:4780"), "http://127.0.0.1:4780");
+  assert.equal(
+    parseWindowsProxyServer("http=127.0.0.1:7890;https=127.0.0.1:10808"),
+    "http://127.0.0.1:10808"
+  );
+  assert.equal(parseWindowsProxyServer("socks=127.0.0.1:1080"), undefined);
+});
+
+test("parses macOS system proxy output", () => {
+  const output = [
+    "<dictionary> {",
+    "  HTTPEnable : 1",
+    "  HTTPPort : 7890",
+    "  HTTPProxy : 127.0.0.1",
+    "}"
+  ].join("\n");
+  assert.equal(parseMacOsProxySettings(output), "http://127.0.0.1:7890");
+});
+
+test("detects and removes unmanaged proxy entries without deleting other env settings", () => {
+  const content = [
+    'CUSTOM_SETTING="keep-me"',
+    'HTTP_PROXY="http://127.0.0.1:4780"',
+    "export https_proxy='http://127.0.0.1:7890'",
+    'NO_PROXY="localhost"'
+  ].join("\n");
+  const entries = findUnmanagedCodexProxyEnv(content);
+  assert.deepEqual(entries.map((entry) => entry.name), ["HTTP_PROXY", "https_proxy", "NO_PROXY"]);
+  const cleaned = removeUnmanagedCodexProxyEnv(content);
+  assert.equal(cleaned, 'CUSTOM_SETTING="keep-me"');
 });
