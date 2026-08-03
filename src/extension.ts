@@ -369,6 +369,7 @@ async function handleProviderManagerAction(
     const provider = message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined;
     await switchToGateway(context, provider);
   }
+  if (action === "claudeOfficial") await switchToOfficial();
   if (action === "manageClaude") await manageGateways(context);
   if (action === "inspectClaude") await inspectClaudeConfiguration();
   if (action === "refreshClaude") await refreshGatewayModels(context, message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined);
@@ -762,6 +763,7 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
   const action = await vscode.window.showQuickPick(
     [
       { label: "切换中转站", action: "switch" },
+      { label: "使用 Claude 官方订阅", action: "official" },
       { label: "添加中转站", action: "add" },
       { label: "删除中转站", action: "remove" },
       { label: "清除某个中转站 Token", action: "clear" },
@@ -777,6 +779,7 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
     return;
   }
   if (action.action === "switch") await switchToGateway(context);
+  if (action.action === "official") await switchToOfficial();
   if (action.action === "add") await addGateway();
   if (action.action === "remove") await removeGateway(context);
   if (action.action === "clear") await clearGatewayToken(context);

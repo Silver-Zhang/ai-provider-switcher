@@ -2,6 +2,28 @@
 
 All notable changes to AI Provider Switcher are documented in this file.
 
+## 0.4.3 - 2026-08-04
+
+- Added a Claude "Use official" action to the visual manager and the Claude gateway management menu, matching the existing Codex official action.
+- Fixed the missing path back to the official Claude subscription from the visual manager, which previously required the Command Palette or Quick Switch.
+
+## 0.4.2 - 2026-07-31
+
+- Added macOS and Linux support for custom Codex providers; the API key bridge is no longer Windows-only.
+- Added a POSIX authentication helper with `0700` directory and `0600` key-file permissions alongside the existing Windows DPAPI helper.
+- Added Codex WebSocket proxy configuration through a managed block in `~/.codex/.env` that preserves unrelated entries.
+- Added system proxy detection from environment variables, VS Code `http.proxy`, Windows Internet Settings, macOS `scutil --proxy`, and GNOME `gsettings`.
+- Added a proxy scope option to apply the managed proxy either only to the official OpenAI provider or to every Codex provider.
+- Added detection and optional cleanup of pre-existing unmanaged proxy variables in `~/.codex/.env`.
+- Added a usage and quota MVP with per-provider read-only JSON usage APIs, automatic field detection, and custom JSON path mapping.
+- Added rate-limit parsing from model-endpoint response headers so usage appears without a dedicated quota API.
+- Added usage configuration management for viewing, editing, testing, and deleting per-provider quota settings.
+- Added confirmation before sending provider credentials to a different origin or over plaintext HTTP.
+- Added usage error classification for HTML login pages, reverse-proxy error pages, and rejected credentials.
+- Added a provider detail view in the visual manager with per-provider switch, model, strategy, and quota actions.
+- Added a new extension logo and Marketplace icon.
+- Changed the visual manager to a responsive layout with a redesigned header.
+
 ## 0.4.1 - 2026-07-28
 
 - Added a per-Provider Claude command strategy selector for Auto, Edit automatically, Manual, and Completely allow.

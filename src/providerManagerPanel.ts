@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 export type ProviderManagerAction =
   | "switchClaude"
+  | "claudeOfficial"
   | "manageClaude"
   | "refreshClaude"
   | "mapClaudeModels"
@@ -239,7 +240,7 @@ function providerOverview(state: ProviderManagerState): string {
     count: item.active ? "当前" : "",
     mapping: `${item.mapping} · 命令：${item.permissionStrategy}`
   })), [
-    ["快速切换", "switchClaude", false], ["模型映射", "mapClaudeModels", false], ["命令策略", "configureClaudePermissions", false], ["管理服务", "manageClaude", true], ["检测外部配置", "inspectClaude", true], ["刷新模型", "refreshClaude", true]
+    ["快速切换", "switchClaude", false], ["模型映射", "mapClaudeModels", false], ["命令策略", "configureClaudePermissions", false], ["使用官方", "claudeOfficial", true], ["管理服务", "manageClaude", true], ["检测外部配置", "inspectClaude", true], ["刷新模型", "refreshClaude", true]
   ])}${providerCard("Codex", state.codexMode, "模型请在 Codex 页面原生模型栏中选择", state.codexProviders.map((item) => ({
     ...item,
     count: `${item.modelCount} 个模型`
