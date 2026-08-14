@@ -32,6 +32,7 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 - 保存命名 Provider，避免反复修改配置文件。
 - 为非 Claude 模型建立完整 Claude 模型族映射。
 - 同步 Codex 自定义 Provider 模型到 Codex 原生模型栏。
+- 统一 Codex 会话历史：官方订阅以共享的 custom 供应商标识运行，官方与第三方会话出现在同一历史列表（可选迁入现有会话，自动备份、可还原）。
 - 检测会覆盖当前设置的 Claude 外部配置。
 - 管理 Codex WebSocket/HTTPS 代理，处理反复重连问题。
 - 切换后保留本地会话历史，不删除已有对话。
@@ -100,6 +101,7 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 | Codex 官方服务 | ✅ | ✅ | ✅ |
 | Codex WebSocket 代理 | ✅ | ✅ | ✅ |
 | Codex 自定义 Provider | ✅ | ✅ | ✅ |
+| 统一 Codex 会话历史 | ✅ | ✅ | ✅ |
 
 其他要求：
 
@@ -193,6 +195,24 @@ Windows PowerShell 如果阻止 `npm.ps1`，可改用 `npm.cmd install` 和 `npm
 
 根地址示例：`https://api.example.com`。扩展会自动派生 `/v1`，不要重复填写。
 
+### 统一 Codex 会话历史（官方与第三方合并为一个历史列表）
+
+Codex 按会话记录中的 `model_provider` 标签把历史分成互不可见的“抽屉”：官方订阅落在内置 `openai` 桶，每个中转站各用独立 ID，因此频繁切换时旧会话看起来像“消失”了。运行 **AI Provider Switcher: Unified Codex Session History**（或 Codex 卡片中的“统一会话历史”）可消除这种割裂：
+
+- **开启后**，官方订阅以共享的 `custom` 供应商标识运行（认证仍走 `auth.json` 的 ChatGPT 登录，`base_url` 缺省回落官方后端，仅分类标签改变），官方与第三方会话出现在同一历史列表中。
+- 开启弹窗提供两种选择：**“开启并迁入现有官方会话”**（推荐，迁移前自动备份）或 **“仅开启（不迁入）”**（只影响开启后新建的会话）。
+- **关闭时**，若存在迁移备份，可选择 **“关闭并按备份还原已迁入会话”**：按备份账本精确翻回，只还原“账本里有且当前仍是 custom”的会话；统一期间新建的会话无法归属供应商，会留在共享列表（重新开启后可见）。
+
+安全设计：
+
+- 迁移/还原**只改写** `session_meta.model_provider`（`~/.codex/sessions`、`archived_sessions` 下的 `.jsonl`）和索引库 `threads.model_provider`（`state_5.sqlite` / `state.db`），不改动任何对话内容。
+- 每次改写前整文件备份到 `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/<时间戳>/`（含 `jsonl/`、`state/` 和记录所属 Codex 目录的 `meta.json`）；还原前再备份到独立的 `codex-official-history-unify-restore-v1/`。
+- 原子写入（临时文件 + 整体替换），改写前后校验文件未被其他进程修改；状态库处于 WAL 模式时安全跳过并提示。
+- 若 `config.toml` 已有手动定义的 `[model_providers.custom]` 段，为避免把流量路由到未知后端，插件拒绝注入并给出提示。
+
+> [!WARNING]
+> 跨供应商继续旧会话时，对方后端可能无法解密会话中的 `encrypted_content` 推理内容，导致继续失败——这是 Codex 上游的设计限制。统一历史解决的是“列表可见性”，不是“同对话跨供应商续聊”；旧会话请尽量在原供应商上继续。
+
 ### 恢复 Codex 官方服务
 
 运行 **AI Provider Switcher: Use Codex Official Provider**，然后重新加载 VS Code。扩展会删除其管理的自定义 Provider 块，并恢复首次接管前记录的 `model_provider`、`model` 和 `model_catalog_json`；这不是整个 `config.toml` 的完整文件回滚。
@@ -261,6 +281,7 @@ NO_PROXY="localhost,127.0.0.1,::1"
 | Codex Provider 配置 | `~/.codex/config.toml` 中的顶层选择和扩展标记块 |
 | Codex 模型目录 | `~/.codex/ai-provider-switcher-models.json` |
 | Codex 代理 | `~/.codex/.env` 中的扩展标记块 |
+| 统一会话历史备份 | `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/`（迁移）与 `codex-official-history-unify-restore-v1/`（还原） |
 | Provider 额度快照 | VS Code 全局设置；仅缓存余额、百分比、限流值和更新时间，不缓存 API 响应正文 |
 
 安全建议：
@@ -292,6 +313,10 @@ NO_PROXY="localhost,127.0.0.1,::1"
 ### 切换 Provider 会删除历史会话吗？
 
 不会。扩展不会删除 Claude 或 Codex 本地会话历史，但不会迁移正在进行的对话上下文。切换后应新建会话。
+
+### 统一会话历史里，跨供应商继续旧会话为什么失败？
+
+会话文件完好无损，失败原因是上游设计：会话中的 `encrypted_content` 推理密文只能由生成它的后端解密，换供应商继续时对方无法解密。回到创建该会话的供应商继续，或直接新建会话即可。
 
 ## 命令参考
 

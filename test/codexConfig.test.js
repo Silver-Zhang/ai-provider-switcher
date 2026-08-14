@@ -5,16 +5,19 @@ const {
   CODEX_MANAGED_END,
   createCodexAuthConfig,
   createCodexModelCatalog,
+  createCodexProviderId,
   findUnmanagedCodexProxyEnv,
   getCodexApiBaseUrl,
   normalizeCodexProxyUrl,
   normalizeProviderRootUrl,
+  parseCodexModelIds,
   parseMacOsProxySettings,
   parseWindowsProxyServer,
   parseTopLevelTomlString,
   removeManagedCodexEnv,
   removeManagedCodexProviders,
   removeUnmanagedCodexProxyEnv,
+  replaceManagedCodexProviders,
   updateManagedCodexEnv,
   updateTopLevelTomlKey
 } = require("../out/codexConfig.js");
@@ -84,6 +87,81 @@ test("removes a missing original top-level key during restore", () => {
   assert.equal(parseTopLevelTomlString(restored, "model_provider"), undefined);
   assert.equal(parseTopLevelTomlString(restored, "model"), undefined);
   assert.match(restored, /\[features\]/);
+});
+
+test("keeps provider blocks while swapping the managed block", () => {
+  const original = [
+    'model_provider = "codex-pateway"',
+    CODEX_MANAGED_BEGIN,
+    "[model_providers.codex-pateway]",
+    CODEX_MANAGED_END,
+    "",
+    "[features]",
+    "js_repl = false"
+  ].join("\n");
+  const block = [CODEX_MANAGED_BEGIN, "[model_providers.codex-real]", CODEX_MANAGED_END].join("\n");
+  const updated = replaceManagedCodexProviders(original, block);
+  assert.doesNotMatch(updated, /model_providers\.codex-pateway/);
+  assert.match(updated, /model_providers\.codex-real/);
+  assert.match(updated, /\[features\]/);
+  assert.equal(updated.match(new RegExp(CODEX_MANAGED_BEGIN, "g")).length, 1);
+});
+
+test("refreshing the managed block leaves every top-level routing key untouched", () => {
+  // A provider edit must not disturb routing: while the official provider is active these keys
+  // hold the user's own values, restored from the pre-switch backup.
+  const original = [
+    'model_provider = "my-own-provider"',
+    'model = "gpt-5.6-sol"',
+    'model_catalog_json = "/home/me/catalog.json"',
+    CODEX_MANAGED_BEGIN,
+    "[model_providers.codex-relay]",
+    'name = "旧名字"',
+    'base_url = "https://old.example.com/v1"',
+    CODEX_MANAGED_END,
+    "",
+    "[features]",
+    "js_repl = false"
+  ].join("\n");
+  const refreshed = replaceManagedCodexProviders(
+    removeManagedCodexProviders(original),
+    [
+      CODEX_MANAGED_BEGIN,
+      "[model_providers.codex-relay]",
+      'name = "新名字"',
+      'base_url = "https://new.example.com/v1"',
+      CODEX_MANAGED_END
+    ].join("\n")
+  );
+  assert.equal(parseTopLevelTomlString(refreshed, "model_provider"), "my-own-provider");
+  assert.equal(parseTopLevelTomlString(refreshed, "model"), "gpt-5.6-sol");
+  assert.equal(parseTopLevelTomlString(refreshed, "model_catalog_json"), "/home/me/catalog.json");
+  assert.match(refreshed, /base_url = "https:\/\/new\.example\.com\/v1"/);
+  assert.doesNotMatch(refreshed, /old\.example\.com/);
+  assert.doesNotMatch(refreshed, /旧名字/);
+  assert.match(refreshed, /\[features\]/);
+});
+
+test("drops the managed block only when no providers remain", () => {
+  const original = [CODEX_MANAGED_BEGIN, "[model_providers.codex-pateway]", CODEX_MANAGED_END].join("\n");
+  assert.equal(replaceManagedCodexProviders(original, ""), "");
+  assert.equal(replaceManagedCodexProviders("[features]\n", "").trim(), "[features]");
+});
+
+test("derives stable Codex provider IDs that survive a re-add", () => {
+  assert.equal(createCodexProviderId("Pateway"), "codex-pateway");
+  assert.equal(createCodexProviderId("  Pateway  "), "codex-pateway");
+  assert.equal(createCodexProviderId("Pateway", ["codex-pateway"]), "codex-pateway-2");
+  assert.equal(createCodexProviderId("Pateway", ["codex-pateway", "codex-pateway-2"]), "codex-pateway-3");
+  assert.equal(createCodexProviderId("中转站"), "codex-provider");
+  assert.equal(createCodexProviderId("--Real Lab--"), "codex-real-lab");
+});
+
+test("parses hand-entered Codex model IDs", () => {
+  assert.deepEqual(parseCodexModelIds("gpt-5.6-sol, gpt-5.6-luna"), ["gpt-5.6-sol", "gpt-5.6-luna"]);
+  assert.deepEqual(parseCodexModelIds("gpt-5.6-sol，gpt-5.6-luna"), ["gpt-5.6-sol", "gpt-5.6-luna"]);
+  assert.deepEqual(parseCodexModelIds(" gpt-5.6-sol  gpt-5.6-sol "), ["gpt-5.6-sol"]);
+  assert.deepEqual(parseCodexModelIds("  ,, "), []);
 });
 
 test("creates a Codex-native model catalog for the picker", () => {

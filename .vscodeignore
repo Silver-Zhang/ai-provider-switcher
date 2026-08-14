@@ -4,6 +4,5 @@ test/**
 src/**
 .gitignore
 README-cn.md
-node_modules/**
 package-lock.json
 images/icon-source.svg

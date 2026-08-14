@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -39,7 +39,8 @@
     "onStartupFinished",
     "onCommand:aiProviderSwitcher.switchMode",
     "onCommand:aiProviderSwitcher.useOfficial",
-    "onCommand:aiProviderSwitcher.useGateway"
+    "onCommand:aiProviderSwitcher.useGateway",
+    "onCommand:aiProviderSwitcher.unifyCodexHistory"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -67,6 +68,10 @@
       {
         "command": "aiProviderSwitcher.addGateway",
         "title": "AI Provider Switcher: Add Claude Gateway"
+      },
+      {
+        "command": "aiProviderSwitcher.editGateway",
+        "title": "AI Provider Switcher: Edit Claude Gateway"
       },
       {
         "command": "aiProviderSwitcher.removeGateway",
@@ -117,6 +122,10 @@
         "title": "AI Provider Switcher: Add Codex Provider"
       },
       {
+        "command": "aiProviderSwitcher.editCodexProvider",
+        "title": "AI Provider Switcher: Edit Codex Provider"
+      },
+      {
         "command": "aiProviderSwitcher.removeCodexProvider",
         "title": "AI Provider Switcher: Remove Codex Provider"
       },
@@ -133,8 +142,16 @@
         "title": "AI Provider Switcher: Show Codex Models"
       },
       {
+        "command": "aiProviderSwitcher.configureCodexModel",
+        "title": "AI Provider Switcher: Configure Codex Default Model"
+      },
+      {
         "command": "aiProviderSwitcher.configureCodexProxy",
         "title": "AI Provider Switcher: Configure Codex WebSocket Proxy"
+      },
+      {
+        "command": "aiProviderSwitcher.unifyCodexHistory",
+        "title": "AI Provider Switcher: Unified Codex Session History"
       },
       {
         "command": "aiProviderSwitcher.refreshProviderUsage",
@@ -403,6 +420,16 @@
           "default": "officialOnly",
           "scope": "machine",
           "description": "Controls whether the managed Codex proxy is active only for the official provider or for all providers."
+        },
+        "aiProviderSwitcher.unifyCodexSessionHistory": {
+          "type": "boolean",
+          "default": false,
+          "description": "Unified Codex session history. When enabled, the official subscription runs under the shared \"custom\" provider id (authentication unchanged) so official and third-party sessions appear in one history list. Resuming an old session on a different provider may fail because its encrypted_content reasoning can only be decrypted by the backend that created it."
+        },
+        "aiProviderSwitcher.unifyCodexMigrateExisting": {
+          "type": "boolean",
+          "default": false,
+          "description": "User opted in to migrate existing official/legacy Codex sessions into the unified history list when the unified-history toggle was enabled. Originals are backed up to ~/.codex/ai-provider-switcher-backups first and can be restored when the toggle is turned off."
         }
       }
     }
@@ -419,5 +446,8 @@
     "@vscode/vsce": "^3.9.2",
     "sharp": "^0.35.3",
     "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.1"
   }
 }

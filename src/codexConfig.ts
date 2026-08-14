@@ -132,6 +132,37 @@ export function removeManagedCodexProviders(content: string): string {
   return content.replace(block, "").trimEnd();
 }
 
+/**
+ * Codex keys its thread list by `model_provider`, so a provider block that disappears from
+ * config.toml leaves the sessions recorded under that ID unresolvable. Keep every managed
+ * block in place — including while the official provider is active — and only swap the
+ * top-level `model_provider` key.
+ */
+export function replaceManagedCodexProviders(content: string, managedBlock: string): string {
+  const unmanaged = removeManagedCodexProviders(content).trimEnd();
+  if (!managedBlock.trim()) return unmanaged;
+  return `${unmanaged}${unmanaged ? "\n\n" : ""}${managedBlock.trimEnd()}\n`;
+}
+
+/**
+ * Provider IDs are the partition key for Codex session history, so they must stay stable
+ * across remove/re-add cycles. A timestamped ID silently strands every earlier thread.
+ */
+export function createCodexProviderId(name: string, existingIds: string[] = []): string {
+  const slug = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const base = `codex-${slug || "provider"}`;
+  if (!existingIds.includes(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!existingIds.includes(candidate)) return candidate;
+  }
+}
+
+/** Accept the comma, full-width comma, or whitespace separators people actually paste. */
+export function parseCodexModelIds(value: string): string[] {
+  return [...new Set(value.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean))];
+}
+
 /** Build a Codex model catalog so custom-provider models appear in Codex's own picker. */
 export function createCodexModelCatalog(modelIds: string[]): { models: Array<Record<string, unknown>> } {
   return {

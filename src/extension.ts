@@ -11,25 +11,51 @@ import {
   CODEX_MANAGED_END,
   createCodexAuthConfig,
   createCodexModelCatalog,
+  createCodexProviderId,
   findUnmanagedCodexProxyEnv,
   getCodexApiBaseUrl,
   normalizeCodexProxyUrl,
   normalizeProviderRootUrl,
+  parseCodexModelIds,
   parseMacOsProxySettings,
   parseWindowsProxyServer,
   parseTopLevelTomlString,
   removeManagedCodexEnv,
   removeManagedCodexProviders,
   removeUnmanagedCodexProxyEnv,
+  replaceManagedCodexProviders,
   updateManagedCodexEnv,
   updateTopLevelTomlKey
 } from "./codexConfig";
 import {
+  CODEX_UNIFIED_PROVIDER_ID,
+  CODEX_UNIFY_BACKUP_NAME,
+  CODEX_UNIFY_RESTORE_BACKUP_NAME,
+  CodexUnifyMigrationOutcome,
+  CodexUnifyRestoreOutcome,
+  canonicalCodexDirKey,
+  hasCodexCustomProviderSection,
+  hasCodexUnifyBackup,
+  migrateCodexHistoryToUnifiedBucket,
+  restoreCodexHistoryFromBackups,
+  serializeCodexUnifiedOfficialBlock,
+  serializeCodexUnifiedProviderBlock,
+  summarizeCodexUnifyFailures
+} from "./codexHistory";
+import {
   ProviderManagerAction,
+  ProviderManagerActionResult,
+  ProviderManagerDraft,
   ProviderManagerMessage,
   ProviderManagerPanel,
   ProviderManagerState
 } from "./providerManagerPanel";
+import {
+  ProviderEditDraft,
+  applyProviderOrder,
+  describeProviderEditOutcome,
+  planProviderEdit
+} from "./providerEdit";
 import {
   ProviderUsageConfiguration,
   ProviderUsageSnapshot,
@@ -99,6 +125,9 @@ const CODEX_ENV_FILE = path.join(os.homedir(), ".codex", ".env");
 const CODEX_BACKUP_KEY = "codex.originalTopLevelConfig";
 const CODEX_PROXY_URL_KEY = "codexProxyUrl";
 const CODEX_PROXY_MODE_KEY = "codexProxyMode";
+const CODEX_UNIFY_HISTORY_KEY = "unifyCodexSessionHistory";
+const CODEX_UNIFY_MIGRATE_KEY = "unifyCodexMigrateExisting";
+const CODEX_UNIFY_MIGRATION_MARKER_KEY = "codex.unifyMigrationMarker";
 const PROVIDER_USAGE_SNAPSHOTS_KEY = "providerUsageSnapshots";
 
 type CodexProxyMode = "officialOnly" | "allProviders";
@@ -127,6 +156,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("aiProviderSwitcher.useGateway", () => switchToGateway(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.manageGateways", () => manageGateways(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.addGateway", () => addGateway()),
+    vscode.commands.registerCommand("aiProviderSwitcher.editGateway", () => editGateway(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.removeGateway", () => removeGateway(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.clearGatewayToken", () => clearGatewayToken(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.openSessionHistory", () =>
@@ -153,6 +183,9 @@ export function activate(context: vscode.ExtensionContext): void {
       manageCodexProviders(context)
     ),
     vscode.commands.registerCommand("aiProviderSwitcher.addCodexProvider", () => addCodexProvider()),
+    vscode.commands.registerCommand("aiProviderSwitcher.editCodexProvider", () =>
+      editCodexProvider(context)
+    ),
     vscode.commands.registerCommand("aiProviderSwitcher.removeCodexProvider", () =>
       removeCodexProvider(context)
     ),
@@ -162,9 +195,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("aiProviderSwitcher.refreshCodexModels", () =>
       refreshCodexModels(context)
     ),
+    vscode.commands.registerCommand("aiProviderSwitcher.configureCodexModel", () =>
+      configureCodexModel(context)
+    ),
     vscode.commands.registerCommand("aiProviderSwitcher.showCodexModels", () => showCodexModels()),
     vscode.commands.registerCommand("aiProviderSwitcher.configureCodexProxy", () =>
       configureCodexProxy()
+    ),
+    vscode.commands.registerCommand("aiProviderSwitcher.unifyCodexHistory", () =>
+      toggleCodexUnifiedHistory(context)
     ),
     vscode.commands.registerCommand("aiProviderSwitcher.refreshProviderUsage", () =>
       refreshProviderUsage(context)
@@ -190,6 +229,16 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void refreshStatusBar();
+
+  // Retry a deferred unified-history migration (e.g. it was skipped because the
+  // live config was not yet routed to the shared bucket). Best effort only.
+  void (async () => {
+    try {
+      await retryCodexUnifiedMigration(context);
+    } catch {
+      // Startup retry must never surface an error.
+    }
+  })();
 }
 
 export function deactivate(): void {
@@ -266,11 +315,15 @@ async function quickSwitchCodex(context: vscode.ExtensionContext): Promise<void>
   if (selected?.target === "custom") await switchToCodexGateway(context);
 }
 
-function openProviderManager(context: vscode.ExtensionContext): void {
+function openProviderManager(
+  context: vscode.ExtensionContext,
+  focus?: { kind: "claude" | "codex"; id: string; edit?: boolean }
+): void {
   ProviderManagerPanel.show(
     context.extensionUri,
     () => getProviderManagerState(),
-    async (message) => handleProviderManagerAction(context, message)
+    async (message) => handleProviderManagerAction(context, message),
+    focus
   );
 }
 
@@ -279,8 +332,10 @@ function getProviderManagerState(): ProviderManagerState {
   const models = new Map(getCodexModels().map((entry) => [entry.providerId, entry.models.length]));
   const usage = new Map(getProviderUsageSnapshots().map((entry) => [`${entry.providerKind}:${entry.providerId}`, entry]));
   const currentClaudeProvider = getCurrentClaudeProvider();
+  const activeCodexId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
   return {
     claudeMode: currentClaudeProvider?.name ?? (getCurrentMode() === ProviderMode.Official ? "官方服务" : "未识别的自定义服务"),
+    claudeOfficial: getCurrentMode() === ProviderMode.Official,
     claudeProviders: getGateways().map((provider) => ({
       id: provider.id,
       name: provider.name,
@@ -296,11 +351,14 @@ function getProviderManagerState(): ProviderManagerState {
       usage: formatProviderUsageSummary(usage.get(`claude:${provider.id}`))
     })),
     codexMode: getCodexModeLabel(),
+    codexOfficial: !getCodexProviders().some((provider) => provider.id === activeCodexId),
     codexModel: settings.get<string>(CODEX_ACTIVE_MODEL_KEY, ""),
+    codexUnifiedHistory: settings.get<boolean>(CODEX_UNIFY_HISTORY_KEY, false),
     codexProviders: getCodexProviders().map((provider) => ({
       id: provider.id,
       name: provider.name,
       baseUrl: provider.baseUrl,
+      active: provider.id === activeCodexId,
       modelCount: models.get(provider.id) ?? 0,
       hasUsageConfig: Boolean(provider.usage),
       usageEndpoint: provider.usage?.endpoint,
@@ -339,12 +397,40 @@ function formatUsageMappings(usage: ProviderUsageConfiguration | undefined): str
 async function handleProviderManagerAction(
   context: vscode.ExtensionContext,
   message: ProviderManagerMessage
-): Promise<void> {
+): Promise<ProviderManagerActionResult | void> {
   const action = message.action;
   if (!action) return;
   const targeted = message.providerKind && message.providerId
     ? getUsageProviderById(message.providerKind, message.providerId)
     : undefined;
+  if (action === "saveProviderEdit") {
+    if (!message.providerKind || !message.providerId || !message.draft) {
+      return { keepEditing: true, message: "表单数据不完整，请重试。" };
+    }
+    return message.providerKind === "claude"
+      ? saveClaudeProviderEdit(context, message.providerId, message.draft)
+      : saveCodexProviderEdit(context, message.providerId, message.draft);
+  }
+  if (action === "reorderProviders" && message.providerKind && message.order) {
+    await reorderProviders(message.providerKind, message.order);
+    return;
+  }
+  if (action === "removeProvider" && message.providerKind && message.providerId) {
+    if (message.providerKind === "claude") {
+      await removeGateway(context, getGateways().find((item) => item.id === message.providerId));
+    } else {
+      await removeCodexProvider(context, getCodexProviders().find((item) => item.id === message.providerId));
+    }
+    return;
+  }
+  if (action === "addClaudeProvider") {
+    await addGateway();
+    return;
+  }
+  if (action === "addCodexProvider") {
+    await addCodexProvider();
+    return;
+  }
   if (action === "refreshUsage" && targeted) {
     await refreshSelectedProviderUsage(targeted, context);
     return;
@@ -381,12 +467,197 @@ async function handleProviderManagerAction(
   }
   if (action === "codexOfficial") await switchToCodexOfficial(context);
   if (action === "manageCodex") await manageCodexProviders(context);
+  if (action === "codexUnify") await toggleCodexUnifiedHistory(context);
   if (action === "refreshCodex") await refreshCodexModels(context, message.providerKind === "codex" ? getCodexProviders().find((item) => item.id === message.providerId) : undefined);
+  if (action === "configureCodexModel") await configureCodexModel(context, message.providerKind === "codex" ? getCodexProviders().find((item) => item.id === message.providerId) : undefined);
   if (action === "configureCodexProxy") await configureCodexProxy();
   if (action === "refreshUsage") await refreshProviderUsage(context);
   if (action === "configureUsage") await configureProviderUsage(context);
   if (action === "manageUsage") await manageProviderUsage(context);
   if (action === "openCodex") await vscode.commands.executeCommand("chatgpt.openSidebar");
+}
+
+/**
+ * Persists a drag-and-drop reorder. The stored array order is what the quick-switch list, the
+ * management menus, and the manager all read, so it is the only thing that has to change — the
+ * active provider is tracked by ID everywhere, never by position.
+ */
+async function reorderProviders(kind: "claude" | "codex", order: string[]): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  if (kind === "claude") {
+    await settings.update(
+      GATEWAYS_KEY.split(".").slice(1).join("."),
+      applyProviderOrder(getGateways(), order),
+      vscode.ConfigurationTarget.Global
+    );
+    return;
+  }
+  await settings.update(
+    CODEX_PROVIDERS_KEY,
+    applyProviderOrder(getCodexProviders(), order),
+    vscode.ConfigurationTarget.Global
+  );
+}
+
+async function saveClaudeProviderEdit(
+  context: vscode.ExtensionContext,
+  id: string,
+  draft: ProviderEditDraft
+): Promise<ProviderManagerActionResult | void> {
+  const gateways = getGateways();
+  const gateway = gateways.find((item) => item.id === id);
+  if (!gateway) {
+    vscode.window.showErrorMessage("该 Claude 中转站已不存在，可能已在别处被删除。");
+    return;
+  }
+
+  const isActive = getCurrentClaudeProvider()?.id === gateway.id;
+  const plan = planProviderEdit("claude", gateway, draft, gateways, isActive);
+  // Reported inside the form rather than as a notification, so the message sits next to the fields.
+  if (!plan.ok) return { keepEditing: true, message: plan.message };
+  if (plan.effects.unchanged) {
+    vscode.window.showInformationMessage("没有需要保存的修改。");
+    return;
+  }
+
+  const updated: GatewayProfile = { ...gateway, name: plan.name, baseUrl: plan.baseUrl };
+  await updateGatewayProfile(updated);
+  if (plan.secret) await context.secrets.store(`${SECRET_KEY_PREFIX}${gateway.id}`, plan.secret);
+  if (plan.effects.clearModelCache) await clearGatewayModels(gateway.id);
+
+  if (plan.effects.rewriteLiveConfig) {
+    const token = await context.secrets.get(`${SECRET_KEY_PREFIX}${gateway.id}`);
+    if (!token) {
+      vscode.window.showWarningMessage(
+        `已保存“${updated.name}”，但没有已保存的 Token，实际生效的配置未更新。请切换到该 Provider 并输入 Token。`
+      );
+      return;
+    }
+    const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+    let merged = mergeManagedEnvVars(getClaudeEnvVars(), updated.baseUrl, token, settings);
+    if (updated.modelMapping) {
+      merged = removeClaudeModelEnvironment(merged);
+      merged.push(...createClaudeModelEnvironment(updated.modelMapping));
+    }
+    await updateClaudeEnvVars(merged);
+  }
+
+  await refreshStatusBar();
+  vscode.window.showInformationMessage(describeProviderEditOutcome(updated.name, plan.effects));
+  if (plan.effects.rewriteLiveConfig) {
+    await offerReload(`“${updated.name}”的配置已写入 Claude。需要重新加载 VS Code 才会生效，是否立即重载？`);
+  }
+}
+
+async function saveCodexProviderEdit(
+  context: vscode.ExtensionContext,
+  id: string,
+  draft: ProviderEditDraft
+): Promise<ProviderManagerActionResult | void> {
+  const providers = getCodexProviders();
+  const provider = providers.find((item) => item.id === id);
+  if (!provider) {
+    vscode.window.showErrorMessage("该 Codex Provider 已不存在，可能已在别处被删除。");
+    return;
+  }
+
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const isActive = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "") === provider.id;
+  const plan = planProviderEdit("codex", provider, draft, providers, isActive);
+  // Reported inside the form rather than as a notification, so the message sits next to the fields.
+  if (!plan.ok) return { keepEditing: true, message: plan.message };
+  if (plan.effects.unchanged) {
+    vscode.window.showInformationMessage("没有需要保存的修改。");
+    return;
+  }
+
+  const updated: CodexProviderProfile = { ...provider, name: plan.name, baseUrl: plan.baseUrl };
+  await settings.update(
+    CODEX_PROVIDERS_KEY,
+    providers.map((item) => (item.id === provider.id ? updated : item)),
+    vscode.ConfigurationTarget.Global
+  );
+  if (plan.secret) {
+    // The key file path is derived from the unchanged provider ID, so the helper keeps working.
+    await context.secrets.store(`${CODEX_SECRET_KEY_PREFIX}${provider.id}`, plan.secret);
+    await writeCodexApiKeyFile(updated, plan.secret);
+  }
+  if (plan.effects.clearModelCache) await clearCodexModels(provider.id);
+
+  let managedBlockRefreshed = false;
+  if (plan.effects.rewriteManagedBlock) {
+    try {
+      managedBlockRefreshed = await refreshCodexManagedProviderBlocks();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      vscode.window.showWarningMessage(
+        `已保存“${updated.name}”，但刷新 ~/.codex/config.toml 失败：${message}`
+      );
+      return;
+    }
+  }
+
+  await refreshStatusBar();
+  vscode.window.showInformationMessage(describeProviderEditOutcome(updated.name, plan.effects));
+  if (isActive && (plan.effects.rewriteLiveConfig || managedBlockRefreshed)) {
+    await offerReload(
+      `“${updated.name}”的配置已写入 ~/.codex/config.toml。${
+        plan.effects.clearModelCache ? "模型缓存已清空，请重载后执行“刷新模型”重新同步模型目录。" : ""
+      }是否立即重载 VS Code？`
+    );
+  }
+}
+
+/**
+ * Rewrites only the managed `[model_providers.*]` blocks, which carry every provider's name and
+ * base_url whether or not it is active. The top-level `model_provider` / `model` /
+ * `model_catalog_json` keys are deliberately left alone: they are owned by the switch flows, and
+ * while the official provider is active they hold the user's own values restored from backup.
+ * Returns false when the installation has no managed block yet, so an edit never creates one.
+ */
+async function refreshCodexManagedProviderBlocks(): Promise<boolean> {
+  const content = await readCodexConfiguration();
+  if (!content.includes(CODEX_MANAGED_BEGIN)) return false;
+
+  const providers = getCodexProviders();
+  const activeId = vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  const active = providers.find((provider) => provider.id === activeId);
+  const unifyOn = isCodexUnifiedHistoryEnabled();
+  if (providers.length > 0) await ensureCodexAuthHelper();
+
+  const unmanaged = removeManagedCodexProviders(content);
+  if (unifyOn && hasCodexCustomProviderSection(unmanaged)) {
+    throw new Error(
+      "config.toml 已存在手动定义的 [model_providers.custom] 段；为避免把流量路由到未知后端，请先删除该段，或关闭“统一 Codex 会话历史”。"
+    );
+  }
+  await writeCodexConfigurationFile(
+    replaceManagedCodexProviders(
+      unmanaged,
+      serializeManagedCodexProviders(providers, unifyOn ? active ?? "official" : undefined)
+    )
+  );
+  return true;
+}
+
+async function clearGatewayModels(gatewayId: string): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  await settings.update(
+    GATEWAY_MODELS_KEY,
+    getGatewayModels().filter((entry) => entry.gatewayId !== gatewayId),
+    vscode.ConfigurationTarget.Global
+  );
+}
+
+async function clearCodexModels(providerId: string): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  await settings.update(
+    CODEX_MODELS_KEY,
+    getCodexModels().filter((entry) => entry.providerId !== providerId),
+    vscode.ConfigurationTarget.Global
+  );
 }
 
 function getCurrentMode(): ProviderMode {
@@ -765,6 +1036,7 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
       { label: "切换中转站", action: "switch" },
       { label: "使用 Claude 官方订阅", action: "official" },
       { label: "添加中转站", action: "add" },
+      { label: "编辑中转站（名称 / Base URL / Token）", action: "edit" },
       { label: "删除中转站", action: "remove" },
       { label: "清除某个中转站 Token", action: "clear" },
       { label: "配置模型映射", action: "mapping" },
@@ -781,6 +1053,7 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
   if (action.action === "switch") await switchToGateway(context);
   if (action.action === "official") await switchToOfficial();
   if (action.action === "add") await addGateway();
+  if (action.action === "edit") await editGateway(context);
   if (action.action === "remove") await removeGateway(context);
   if (action.action === "clear") await clearGatewayToken(context);
   if (action.action === "mapping") await configureClaudeModelMapping(context);
@@ -1002,16 +1275,30 @@ async function addGateway(): Promise<GatewayProfile | undefined> {
   return gateway;
 }
 
-async function removeGateway(context: vscode.ExtensionContext): Promise<void> {
+/** Editing happens in the manager's form, so the palette command just lands the user on it. */
+async function editGateway(
+  context: vscode.ExtensionContext,
+  selectedGateway?: GatewayProfile
+): Promise<void> {
+  const gateway = selectedGateway ?? await pickGateway();
+  if (!gateway) return;
+  openProviderManager(context, { kind: "claude", id: gateway.id, edit: true });
+}
+
+/** `selectedGateway` comes from the manager, where the target was already chosen by clicking it. */
+async function removeGateway(
+  context: vscode.ExtensionContext,
+  selectedGateway?: GatewayProfile
+): Promise<void> {
   const gateways = getGateways();
-  const selected = await vscode.window.showQuickPick(
-    gateways.map((gateway) => ({ label: gateway.name, description: gateway.baseUrl, gateway })),
+  const gateway = selectedGateway ?? (await vscode.window.showQuickPick(
+    gateways.map((item) => ({ label: item.name, description: item.baseUrl, gateway: item })),
     { title: "删除 Claude 中转站" }
-  );
-  if (!selected) return;
+  ))?.gateway;
+  if (!gateway) return;
 
   const confirm = await vscode.window.showWarningMessage(
-    `确定删除“${selected.gateway.name}”？`,
+    `确定删除“${gateway.name}”？`,
     { modal: true },
     "删除"
   );
@@ -1020,11 +1307,11 @@ async function removeGateway(context: vscode.ExtensionContext): Promise<void> {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   await settings.update(
     GATEWAYS_KEY.split(".").slice(1).join("."),
-    gateways.filter((gateway) => gateway.id !== selected.gateway.id),
+    gateways.filter((item) => item.id !== gateway.id),
     vscode.ConfigurationTarget.Global
   );
-  await context.secrets.delete(`${SECRET_KEY_PREFIX}${selected.gateway.id}`);
-  vscode.window.showInformationMessage(`已删除中转站：${selected.gateway.name}`);
+  await context.secrets.delete(`${SECRET_KEY_PREFIX}${gateway.id}`);
+  vscode.window.showInformationMessage(`已删除中转站：${gateway.name}`);
 }
 
 async function clearGatewayToken(context: vscode.ExtensionContext): Promise<void> {
@@ -1392,23 +1679,19 @@ async function switchToCodexGateway(context: vscode.ExtensionContext, selectedPr
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
 
   try {
-    let models = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
-    if (models.length === 0) {
-      const response = await requestCodexModels(provider.baseUrl, apiKey);
-      models = response.models;
-      await saveCodexModels(provider.id, models);
-      await saveUsageFromResponseHeaders("codex", provider.id, response.headers);
-    }
-    if (models.length === 0) {
-      throw new Error("该 Provider 没有返回可用模型");
-    }
+    const models = await resolveCodexModels(provider, apiKey);
+    if (!models) return;
     await writeCodexConfiguration(context, provider, models);
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, provider.id, vscode.ConfigurationTarget.Global);
     await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
     await synchronizeCodexProxyForProvider(settings);
     await refreshStatusBar();
     await offerReload(
-      `Codex 已切换到“${provider.name}”。已同步 ${models.length} 个模型；重载后请直接在 Codex 页面原生模型栏中选择。是否立即重载？`
+      `Codex 已切换到“${provider.name}”。已同步 ${models.length} 个模型；重载后请直接在 Codex 页面原生模型栏中选择。${
+        isCodexUnifiedHistoryEnabled()
+          ? "统一会话历史已开启：官方与第三方会话共用同一历史列表。"
+          : ""
+      }是否立即重载？`
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
@@ -1423,32 +1706,327 @@ async function switchToCodexOfficial(context: vscode.ExtensionContext): Promise<
   try {
     const content = await readCodexConfiguration();
     const backup = context.globalState.get<CodexSelectionBackup>(CODEX_BACKUP_KEY);
-    const withoutManagedProviders = removeManagedCodexProviders(content);
-    const restored = updateTopLevelTomlKey(
-      updateTopLevelTomlKey(
-        withoutManagedProviders,
-        "model_provider",
-        backup?.hadModelProvider ? backup.modelProvider : undefined
-      ),
-      "model",
-      backup?.hadModel ? backup.model : undefined
+    const unifyOn = isCodexUnifiedHistoryEnabled();
+    const providers = getCodexProviders();
+    if (providers.length > 0) await ensureCodexAuthHelper();
+    let updated = updateTopLevelTomlKey(
+      content,
+      "model_provider",
+      unifyOn ? CODEX_UNIFIED_PROVIDER_ID : backup?.hadModelProvider ? backup.modelProvider : undefined
     );
-    const restoredCatalog = updateTopLevelTomlKey(
-      restored,
+    updated = updateTopLevelTomlKey(updated, "model", backup?.hadModel ? backup.model : undefined);
+    updated = updateTopLevelTomlKey(
+      updated,
       "model_catalog_json",
       backup?.hadModelCatalog ? backup.modelCatalog : undefined
     );
-    await writeCodexConfigurationFile(restoredCatalog);
+    updated = removeManagedCodexProviders(updated);
+    if (unifyOn && hasCodexCustomProviderSection(updated)) {
+      throw new Error(
+        "config.toml 已存在手动定义的 [model_providers.custom] 段；为避免把流量路由到未知后端，请先删除该段，或关闭“统一 Codex 会话历史”。"
+      );
+    }
+    // Keep the custom provider blocks so threads recorded under those IDs stay resolvable.
+    await writeCodexConfigurationFile(
+      replaceManagedCodexProviders(
+        updated,
+        serializeManagedCodexProviders(providers, unifyOn ? "official" : undefined)
+      )
+    );
 
     const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
     await settings.update(CODEX_ACTIVE_PROVIDER_KEY, "", vscode.ConfigurationTarget.Global);
+    await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
     await synchronizeCodexProxyForProvider(settings);
     await refreshStatusBar();
-    await offerReload("Codex 已恢复为官方 OpenAI Provider。是否立即重载 VS Code？");
+    await offerReload(
+      unifyOn
+        ? "Codex 已恢复为官方 OpenAI Provider。官方订阅将以共享的 custom 供应商标识运行，官方与第三方会话进入同一历史列表。是否立即重载 VS Code？"
+        : "Codex 已恢复为官方 OpenAI Provider。是否立即重载 VS Code？"
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : "未知错误";
     vscode.window.showErrorMessage(`恢复 Codex 官方 Provider 失败：${message}`);
   }
+}
+
+function isCodexUnifiedHistoryEnabled(): boolean {
+  return vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .get<boolean>(CODEX_UNIFY_HISTORY_KEY, false);
+}
+
+function getCodexUnifiedMigrationRequested(): boolean {
+  return vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .get<boolean>(CODEX_UNIFY_MIGRATE_KEY, false);
+}
+
+function getCodexDir(): string {
+  return path.dirname(CODEX_CONFIG_FILE);
+}
+
+function getCodexThirdPartyTagIds(): string[] {
+  return getCodexProviders().map((provider) => provider.id);
+}
+
+function getCodexUnifyBackupParent(): string {
+  return path.join(getCodexDir(), "ai-provider-switcher-backups", CODEX_UNIFY_BACKUP_NAME);
+}
+
+function getCodexUnifyRestoreParent(): string {
+  return path.join(getCodexDir(), "ai-provider-switcher-backups", CODEX_UNIFY_RESTORE_BACKUP_NAME);
+}
+
+/** How many silent startup retries a partially failed migration gets. */
+const CODEX_UNIFY_MAX_RETRY_ATTEMPTS = 3;
+
+type CodexUnifyMigrationMarker = {
+  codexDirKey: string;
+  completedAt: string;
+  migratedJsonlFiles: number;
+  migratedStateRows: number;
+  /** Items that could not be migrated on the last attempt. */
+  pendingFailures?: number;
+  /** Attempts made so far, so a permanently locked file cannot retry forever. */
+  attempts?: number;
+};
+
+/**
+ * Retries a deferred or partially failed migration once per startup. A run that
+ * left failures behind is retried (locks are usually transient) but only up to
+ * CODEX_UNIFY_MAX_RETRY_ATTEMPTS times, after which the user is told once
+ * instead of the extension silently rescanning on every launch.
+ */
+async function retryCodexUnifiedMigration(context: vscode.ExtensionContext): Promise<void> {
+  if (!isCodexUnifiedHistoryEnabled() || !getCodexUnifiedMigrationRequested()) return;
+  const codexDirKey = canonicalCodexDirKey(getCodexDir());
+  const marker = context.globalState.get<CodexUnifyMigrationMarker>(CODEX_UNIFY_MIGRATION_MARKER_KEY);
+  if (marker?.codexDirKey === codexDirKey) {
+    const pending = marker.pendingFailures ?? 0;
+    if (pending === 0) return;
+    if ((marker.attempts ?? 1) >= CODEX_UNIFY_MAX_RETRY_ATTEMPTS) return;
+  }
+  const outcome = await runCodexUnifiedMigration(context, false);
+  if (outcome.failures.length === 0) return;
+  const attempts = (marker?.codexDirKey === codexDirKey ? marker.attempts ?? 1 : 0) + 1;
+  if (attempts < CODEX_UNIFY_MAX_RETRY_ATTEMPTS) return;
+  // Out of silent retries: surface it rather than leaving history half-migrated.
+  vscode.window.showWarningMessage(
+    `部分 Codex 会话未能迁入共享历史列表（${outcome.failures.length} 项），已停止自动重试。关闭 Codex 面板与所有 codex 终端后运行“统一 Codex 会话历史”可再次尝试。原因：${summarizeCodexUnifyFailures(outcome.failures)}`
+  );
+}
+
+async function runCodexUnifiedMigration(
+  context: vscode.ExtensionContext,
+  interactive: boolean
+): Promise<CodexUnifyMigrationOutcome> {
+  const codexDir = getCodexDir();
+  const codexDirKey = canonicalCodexDirKey(codexDir);
+  const previous = context.globalState.get<CodexUnifyMigrationMarker>(CODEX_UNIFY_MIGRATION_MARKER_KEY);
+  const content = await readCodexConfiguration().catch(() => "");
+  const outcome = await migrateCodexHistoryToUnifiedBucket({
+    codexDir,
+    configText: content,
+    thirdPartyTagIds: getCodexThirdPartyTagIds(),
+    backupParent: getCodexUnifyBackupParent()
+  });
+  // Mark done for every outcome except "live_not_unified": that one defers the
+  // migration while keeping the user's intent for a later retry. Per-item
+  // failures no longer throw, so they are recorded on the marker instead.
+  if (outcome.skippedReason !== "live_not_unified") {
+    await context.globalState.update(CODEX_UNIFY_MIGRATION_MARKER_KEY, {
+      codexDirKey,
+      completedAt: new Date().toISOString(),
+      migratedJsonlFiles: outcome.migratedJsonlFiles,
+      migratedStateRows: outcome.migratedStateRows,
+      pendingFailures: outcome.failures.length,
+      attempts: (previous?.codexDirKey === codexDirKey ? previous.attempts ?? 1 : 0) + 1
+    } satisfies CodexUnifyMigrationMarker);
+  }
+  if (interactive) reportCodexUnifyMigrationOutcome(outcome);
+  return outcome;
+}
+
+function reportCodexUnifyMigrationOutcome(outcome: CodexUnifyMigrationOutcome): void {
+  if (outcome.skippedReason === "live_not_unified") {
+    vscode.window.showWarningMessage(
+      "尚未执行迁移：Codex 当前配置还没有路由到共享 custom 桶。重载 VS Code 或切换一次 Codex 服务后会自动重试。"
+    );
+    return;
+  }
+  if (outcome.skippedReason === "nothing_to_migrate") {
+    vscode.window.showInformationMessage(
+      "没有需要迁移的旧会话；开启后新建的官方与第三方会话将共用同一历史列表。"
+    );
+    return;
+  }
+  const summary = `已把 ${outcome.migratedJsonlFiles} 个会话文件、${outcome.migratedStateRows} 条索引记录迁入共享历史列表（原文件已自动备份）。`;
+  if (outcome.failures.length > 0) {
+    vscode.window.showWarningMessage(
+      `${summary}另有 ${outcome.failures.length} 项未能迁移，通常是 Codex 正在占用相应文件；关闭 Codex 后再次运行本命令即可重试。原因：${summarizeCodexUnifyFailures(outcome.failures)}`
+    );
+    return;
+  }
+  vscode.window.showInformationMessage(summary);
+}
+
+function reportCodexUnifyRestoreOutcome(outcome: CodexUnifyRestoreOutcome): void {
+  if (outcome.skippedReason === "no_backup_ledger") {
+    vscode.window.showInformationMessage(
+      "没有可还原的迁移备份（可能从未迁入过会话）；此前的官方会话一直在官方列表中。"
+    );
+    return;
+  }
+  if (outcome.skippedReason === "nothing_to_restore") {
+    vscode.window.showInformationMessage("没有需要还原的内容（备份账本中的会话此前已还原过）。");
+    return;
+  }
+  const summary = `已按备份还原迁入的会话（${outcome.restoredJsonlFiles} 个会话文件、${outcome.restoredStateRows} 条索引记录）。`;
+  if (outcome.failures.length > 0) {
+    vscode.window.showWarningMessage(
+      `${summary}另有 ${outcome.failures.length} 项未能还原；备份仍完好，关闭 Codex 后重新开启再关闭统一历史即可重试。原因：${summarizeCodexUnifyFailures(outcome.failures)}`
+    );
+    return;
+  }
+  vscode.window.showInformationMessage(summary);
+}
+
+/**
+ * Re-routes the live config.toml to match the unified-history toggle without a
+ * full provider switch: with the toggle on the active provider (or the official
+ * subscription) runs under the shared `custom` id; with it off the previous
+ * per-provider ids are restored.
+ */
+async function applyCodexUnifiedLiveConfig(): Promise<void> {
+  const content = await readCodexConfiguration();
+  const providers = getCodexProviders();
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const activeId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  const active = providers.find((provider) => provider.id === activeId);
+  const unifyOn = isCodexUnifiedHistoryEnabled();
+  if (providers.length > 0) await ensureCodexAuthHelper();
+  let updated = removeManagedCodexProviders(content);
+  if (unifyOn && hasCodexCustomProviderSection(updated)) {
+    throw new Error(
+      "config.toml 已存在手动定义的 [model_providers.custom] 段；为避免把流量路由到未知后端，请先删除该段，或关闭“统一 Codex 会话历史”。"
+    );
+  }
+  updated = updateTopLevelTomlKey(
+    updated,
+    "model_provider",
+    unifyOn ? CODEX_UNIFIED_PROVIDER_ID : active ? active.id : undefined
+  );
+  await writeCodexConfigurationFile(
+    replaceManagedCodexProviders(
+      updated,
+      serializeManagedCodexProviders(providers, unifyOn ? active ?? "official" : undefined)
+    )
+  );
+}
+
+async function toggleCodexUnifiedHistory(context: vscode.ExtensionContext): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const enabled = settings.get<boolean>(CODEX_UNIFY_HISTORY_KEY, false);
+
+  if (enabled) {
+    const marker = context.globalState.get<CodexUnifyMigrationMarker>(CODEX_UNIFY_MIGRATION_MARKER_KEY);
+    const migrationPending =
+      getCodexUnifiedMigrationRequested() &&
+      marker?.codexDirKey !== canonicalCodexDirKey(getCodexDir());
+    if (migrationPending) {
+      const choice = await vscode.window.showWarningMessage(
+        "统一会话历史已开启，但会话迁移尚未完成。是否立即重试迁移？",
+        { modal: true },
+        "重试迁移",
+        "关闭统一历史"
+      );
+      if (choice === "重试迁移") {
+        try {
+          await runCodexUnifiedMigration(context, true);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "未知错误";
+          vscode.window.showErrorMessage(`迁移会话历史失败：${message}`);
+        }
+        return;
+      }
+      if (choice !== "关闭统一历史") return;
+      // User chose to disable: fall through to the disable flow below.
+    }
+  }
+
+  if (!enabled) {
+    const choice = await vscode.window.showWarningMessage(
+      "开启后，官方订阅将以共享的 custom 供应商标识运行，官方与第三方会话出现在同一历史列表中。注意：跨供应商继续旧会话时，对方后端可能无法解密会话中的 encrypted_content 推理内容，导致继续失败。",
+      { modal: true },
+      "开启并迁入现有官方会话",
+      "仅开启（不迁入）"
+    );
+    if (!choice) return;
+    const migrate = choice === "开启并迁入现有官方会话";
+    try {
+      await settings.update(CODEX_UNIFY_HISTORY_KEY, true, vscode.ConfigurationTarget.Global);
+      await settings.update(CODEX_UNIFY_MIGRATE_KEY, migrate, vscode.ConfigurationTarget.Global);
+      await applyCodexUnifiedLiveConfig();
+    } catch (error) {
+      await settings.update(CODEX_UNIFY_HISTORY_KEY, false, vscode.ConfigurationTarget.Global);
+      await settings.update(CODEX_UNIFY_MIGRATE_KEY, false, vscode.ConfigurationTarget.Global);
+      const message = error instanceof Error ? error.message : "未知错误";
+      vscode.window.showErrorMessage(`开启统一 Codex 会话历史失败：${message}`);
+      return;
+    }
+    if (migrate) {
+      try {
+        await runCodexUnifiedMigration(context, true);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "未知错误";
+        vscode.window.showErrorMessage(
+          `迁移会话历史失败（开关已开启，重载或再次运行本命令会自动重试）：${message}`
+        );
+      }
+    } else {
+      vscode.window.showInformationMessage(
+        "已开启统一 Codex 会话历史。开启后新建的会话进入共享历史列表；此前的官方会话仍留在官方列表，需要时再次运行本命令并选择“开启并迁入现有官方会话”。"
+      );
+    }
+    await offerReload("统一 Codex 会话历史已开启。是否立即重载 VS Code？");
+    return;
+  }
+
+  const backupAvailable = hasCodexUnifyBackup(getCodexUnifyBackupParent(), getCodexDir());
+  const restoreChoice = await vscode.window.showWarningMessage(
+    "关闭后，官方订阅与第三方将恢复各自独立的历史列表。统一期间新建的会话无法归属供应商，将留在共享列表（重新开启后可见）。",
+    { modal: true },
+    ...(backupAvailable
+      ? ["关闭并按备份还原已迁入会话" as const, "仅关闭（不还原）" as const]
+      : ["仅关闭（不还原）" as const])
+  );
+  if (!restoreChoice) return;
+  const restore = restoreChoice === "关闭并按备份还原已迁入会话";
+  try {
+    await settings.update(CODEX_UNIFY_HISTORY_KEY, false, vscode.ConfigurationTarget.Global);
+    await settings.update(CODEX_UNIFY_MIGRATE_KEY, false, vscode.ConfigurationTarget.Global);
+    await context.globalState.update(CODEX_UNIFY_MIGRATION_MARKER_KEY, undefined);
+    await applyCodexUnifiedLiveConfig();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    vscode.window.showErrorMessage(`关闭统一 Codex 会话历史失败：${message}`);
+    return;
+  }
+  if (restore) {
+    try {
+      const outcome = await restoreCodexHistoryFromBackups({
+        codexDir: getCodexDir(),
+        backupParent: getCodexUnifyBackupParent(),
+        restoreBackupParent: getCodexUnifyRestoreParent()
+      });
+      reportCodexUnifyRestoreOutcome(outcome);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      vscode.window.showErrorMessage(`还原会话历史失败，请重试（数据未损坏）：${message}`);
+    }
+  }
+  await offerReload("统一 Codex 会话历史已关闭。是否立即重载 VS Code？");
 }
 
 async function manageCodexProviders(context: vscode.ExtensionContext): Promise<void> {
@@ -1457,10 +2035,18 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
       { label: "切换 Codex 中转站", action: "switch" },
       { label: "使用 Codex 官方 OpenAI Provider", action: "official" },
       { label: "添加 Codex 中转站", action: "add" },
+      { label: "编辑 Codex 中转站（名称 / Base URL / API Key）", action: "edit" },
       { label: "删除 Codex 中转站", action: "remove" },
       { label: "清除某个 Codex API Key", action: "clear" },
+      { label: "选择 Codex 默认模型", action: "model" },
       { label: "刷新并同步 Codex 模型", action: "refresh" },
       { label: "配置 Codex WebSocket 代理", action: "proxy" },
+      {
+        label: isCodexUnifiedHistoryEnabled()
+          ? "$(history) 关闭统一 Codex 会话历史"
+          : "$(history) 统一 Codex 会话历史",
+        action: "unify"
+      },
       { label: "打开 Codex 页面选择模型", action: "open" },
       { label: "查看 Codex 模型", action: "show" }
     ],
@@ -1471,10 +2057,13 @@ async function manageCodexProviders(context: vscode.ExtensionContext): Promise<v
   if (action.action === "switch") await switchToCodexGateway(context);
   if (action.action === "official") await switchToCodexOfficial(context);
   if (action.action === "add") await addCodexProvider();
+  if (action.action === "edit") await editCodexProvider(context);
   if (action.action === "remove") await removeCodexProvider(context);
   if (action.action === "clear") await clearCodexApiKey(context);
+  if (action.action === "model") await configureCodexModel(context);
   if (action.action === "refresh") await refreshCodexModels(context);
   if (action.action === "proxy") await configureCodexProxy();
+  if (action.action === "unify") await toggleCodexUnifiedHistory(context);
   if (action.action === "open") await vscode.commands.executeCommand("chatgpt.openSidebar");
   if (action.action === "show") await showCodexModels();
 }
@@ -1493,9 +2082,9 @@ async function addCodexProvider(): Promise<CodexProviderProfile | undefined> {
     return undefined;
   }
 
-  const id = `codex-${name.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${Date.now()}`;
+  // Reusing a stable ID keeps Codex's per-provider session history reachable after a re-add.
   const provider: CodexProviderProfile = {
-    id,
+    id: createCodexProviderId(name, getCodexProviders().map((item) => item.id)),
     name: name.trim(),
     baseUrl: normalizeProviderRootUrl(baseUrl.trim())
   };
@@ -1509,24 +2098,37 @@ async function addCodexProvider(): Promise<CodexProviderProfile | undefined> {
   return provider;
 }
 
-async function removeCodexProvider(context: vscode.ExtensionContext): Promise<void> {
+async function editCodexProvider(
+  context: vscode.ExtensionContext,
+  selectedProvider?: CodexProviderProfile
+): Promise<void> {
+  const provider = selectedProvider ?? await pickCodexProvider();
+  if (!provider) return;
+  openProviderManager(context, { kind: "codex", id: provider.id, edit: true });
+}
+
+/** `selectedProvider` comes from the manager, where the target was already chosen by clicking it. */
+async function removeCodexProvider(
+  context: vscode.ExtensionContext,
+  selectedProvider?: CodexProviderProfile
+): Promise<void> {
   const providers = getCodexProviders();
-  const selected = await vscode.window.showQuickPick(
-    providers.map((provider) => ({ label: provider.name, description: provider.baseUrl, provider })),
+  const provider = selectedProvider ?? (await vscode.window.showQuickPick(
+    providers.map((item) => ({ label: item.name, description: item.baseUrl, provider: item })),
     { title: "删除 Codex Provider" }
-  );
-  if (!selected) return;
+  ))?.provider;
+  if (!provider) return;
 
   const activeId = vscode.workspace
     .getConfiguration("aiProviderSwitcher")
     .get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
-  if (activeId === selected.provider.id) {
+  if (activeId === provider.id) {
     vscode.window.showWarningMessage("当前 Codex Provider 正在使用，请先切换到官方 Provider 后再删除。");
     return;
   }
 
   const confirm = await vscode.window.showWarningMessage(
-    `确定删除“${selected.provider.name}”？`,
+    `确定删除“${provider.name}”？Codex 已经记录的会话不会被删除。每条会话都固定记着创建时所用的 Provider ID，用同样的名称重新添加会沿用同一个 ID。`,
     { modal: true },
     "删除"
   );
@@ -1535,12 +2137,12 @@ async function removeCodexProvider(context: vscode.ExtensionContext): Promise<vo
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   await settings.update(
     CODEX_PROVIDERS_KEY,
-    providers.filter((provider) => provider.id !== selected.provider.id),
+    providers.filter((item) => item.id !== provider.id),
     vscode.ConfigurationTarget.Global
   );
-  await context.secrets.delete(`${CODEX_SECRET_KEY_PREFIX}${selected.provider.id}`);
-  await deleteCodexApiKeyFile(selected.provider);
-  vscode.window.showInformationMessage(`已删除 Codex Provider：${selected.provider.name}`);
+  await context.secrets.delete(`${CODEX_SECRET_KEY_PREFIX}${provider.id}`);
+  await deleteCodexApiKeyFile(provider);
+  vscode.window.showInformationMessage(`已删除 Codex Provider：${provider.name}`);
 }
 
 async function clearCodexApiKey(context: vscode.ExtensionContext): Promise<void> {
@@ -1571,9 +2173,159 @@ async function pickCodexProvider(): Promise<CodexProviderProfile | undefined> {
   return selected?.provider;
 }
 
+/**
+ * Not every Responses API gateway exposes /v1/models, so fall back to hand-entered IDs
+ * instead of blocking the switch. Returns undefined only when the user backs out.
+ */
+async function resolveCodexModels(
+  provider: CodexProviderProfile,
+  apiKey: string
+): Promise<string[] | undefined> {
+  const cached = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
+  if (cached.length > 0) return cached;
+
+  let discoveryError = "";
+  try {
+    const response = await requestCodexModels(provider.baseUrl, apiKey);
+    await saveUsageFromResponseHeaders("codex", provider.id, response.headers);
+    if (response.models.length > 0) {
+      await saveCodexModels(provider.id, response.models);
+      return response.models;
+    }
+  } catch (error) {
+    discoveryError = error instanceof Error ? error.message : "未知网络错误";
+  }
+
+  const manual = await promptCodexModelIds(
+    provider,
+    discoveryError
+      ? `“${provider.name}”的模型列表获取失败（${discoveryError}）。`
+      : `“${provider.name}”没有返回任何模型。`
+  );
+  if (!manual) return undefined;
+  await saveCodexModels(provider.id, manual);
+  return manual;
+}
+
+async function promptCodexModelIds(
+  provider: CodexProviderProfile,
+  reason: string,
+  value = ""
+): Promise<string[] | undefined> {
+  const entered = await vscode.window.showInputBox({
+    title: `手动填写 ${provider.name} 的模型`,
+    prompt: `${reason}请输入该服务接受的模型 ID，多个用逗号分隔；它们会被同步到 Codex 原生模型栏。`,
+    value,
+    ignoreFocusOut: true,
+    validateInput: (input) =>
+      parseCodexModelIds(input).length > 0 ? undefined : "至少填写一个模型 ID"
+  });
+  if (entered === undefined) return undefined;
+  const models = parseCodexModelIds(entered);
+  return models.length > 0 ? models : undefined;
+}
+
+/** Pins the top-level `model` key in ~/.codex/config.toml for the active custom provider. */
+async function configureCodexModel(
+  context: vscode.ExtensionContext,
+  selectedProvider?: CodexProviderProfile
+): Promise<void> {
+  const activeId = vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
+  const provider = selectedProvider ?? getCodexProviders().find((item) => item.id === activeId);
+
+  if (!provider) {
+    const choice = await vscode.window.showInformationMessage(
+      "Codex 正在使用官方服务，模型由 Codex 自己的模型栏决定。切换到自定义服务后即可在这里固定默认模型。",
+      "切换 Codex 服务"
+    );
+    if (choice === "切换 Codex 服务") await switchToCodexGateway(context);
+    return;
+  }
+  if (provider.id !== activeId) {
+    const choice = await vscode.window.showWarningMessage(
+      `“${provider.name}”不是当前 Codex Provider，默认模型只能为当前 Provider 固定。`,
+      "先切换到该 Provider",
+      "取消"
+    );
+    if (choice === "先切换到该 Provider") await switchToCodexGateway(context, provider);
+    return;
+  }
+
+  const apiKey = await getStoredCodexApiKey(context, provider);
+  if (!apiKey) {
+    vscode.window.showWarningMessage(`“${provider.name}”尚未保存 API Key，请先切换到该 Provider。`);
+    return;
+  }
+
+  const models = await resolveCodexModels(provider, apiKey);
+  if (!models) return;
+
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const current = settings.get<string>(CODEX_ACTIVE_MODEL_KEY, "");
+  const picked = await pickCodexModel(provider, models, current);
+  if (picked === undefined) return;
+
+  const nextModels = picked && !models.includes(picked) ? [...models, picked] : models;
+  if (nextModels.length !== models.length) await saveCodexModels(provider.id, nextModels);
+  await writeCodexConfiguration(context, provider, nextModels, picked || undefined);
+  await settings.update(CODEX_ACTIVE_MODEL_KEY, picked, vscode.ConfigurationTarget.Global);
+  await refreshStatusBar();
+  await offerReload(
+    picked
+      ? `Codex 默认模型已固定为“${picked}”。是否立即重载 VS Code？`
+      : "Codex 默认模型已交回原生模型栏决定。是否立即重载 VS Code？"
+  );
+}
+
+/** Returns "" to unpin, undefined when cancelled. */
+async function pickCodexModel(
+  provider: CodexProviderProfile,
+  models: string[],
+  current: string
+): Promise<string | undefined> {
+  const selected = await vscode.window.showQuickPick(
+    [
+      ...models.map((model) => ({
+        label: model,
+        description: model === current ? "当前默认模型" : "已同步到 Codex 模型栏",
+        choice: "model" as const,
+        model
+      })),
+      {
+        label: "$(edit) 手动输入模型 ID",
+        description: "模型列表不完整时使用",
+        choice: "manual" as const,
+        model: ""
+      },
+      {
+        label: "$(circle-slash) 交回 Codex 原生模型栏",
+        description: current ? "移除已固定的默认模型" : "当前行为",
+        choice: "native" as const,
+        model: ""
+      }
+    ],
+    {
+      title: `选择 ${provider.name} 的默认模型`,
+      placeHolder: "写入 ~/.codex/config.toml 的顶层 model 键"
+    }
+  );
+  if (!selected) return undefined;
+  if (selected.choice !== "manual") return selected.model;
+  const entered = await vscode.window.showInputBox({
+    title: `输入 ${provider.name} 的默认模型 ID`,
+    prompt: "该模型会写入 config.toml 的顶层 model 键，并同步到 Codex 原生模型栏",
+    value: current,
+    ignoreFocusOut: true,
+    validateInput: (input) => (input.trim() ? undefined : "模型 ID 不能为空")
+  });
+  return entered?.trim() || undefined;
+}
+
 async function confirmCodexProviderSwitch(target: string): Promise<boolean> {
   const choice = await vscode.window.showInformationMessage(
-    `准备切换到“${target}”。Codex 本地会话历史不会被删除，但当前对话不会自动迁移到新的 Provider 或模型。是否继续？`,
+    `准备切换到“${target}”。已有会话记录不会被删除，但当前对话不会自动迁移到新的 Provider 或模型——每条会话固定绑定创建时的 Provider，切换后请新建对话。是否继续？`,
     { modal: true },
     "继续切换",
     "取消"
@@ -1622,13 +2374,25 @@ async function refreshCodexModels(context: vscode.ExtensionContext, selectedProv
   try {
     const response = await requestCodexModels(provider.baseUrl, apiKey);
     const models = response.models;
-    await saveCodexModels(provider.id, models);
     await saveUsageFromResponseHeaders("codex", provider.id, response.headers);
+    if (models.length === 0) {
+      // Never let an empty response wipe a hand-entered catalog.
+      const cached = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
+      vscode.window.showWarningMessage(
+        cached.length > 0
+          ? `“${provider.name}”没有返回任何模型，已保留原有的 ${cached.length} 个模型。`
+          : `“${provider.name}”没有返回任何模型，请在切换或配置模型时手动填写模型 ID。`
+      );
+      return;
+    }
+    await saveCodexModels(provider.id, models);
     const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
     const activeProviderId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
     if (activeProviderId === provider.id) {
-      await writeCodexConfiguration(context, provider, models);
-      await settings.update(CODEX_ACTIVE_MODEL_KEY, "", vscode.ConfigurationTarget.Global);
+      const pinned = settings.get<string>(CODEX_ACTIVE_MODEL_KEY, "");
+      const keptModel = pinned && models.includes(pinned) ? pinned : "";
+      await writeCodexConfiguration(context, provider, models, keptModel || undefined);
+      await settings.update(CODEX_ACTIVE_MODEL_KEY, keptModel, vscode.ConfigurationTarget.Global);
     }
     const choice = await vscode.window.showInformationMessage(
       `已从“${provider.name}”刷新 ${models.length} 个 Codex 模型${activeProviderId === provider.id ? "，并同步到 Codex 原生模型栏；重载后生效" : ""}。`,
@@ -2199,12 +2963,23 @@ async function writeCodexConfiguration(
   await ensureCodexAuthHelper();
   await writeCodexModelCatalog(models);
   const providers = getCodexProviders();
+  const unifyOn = isCodexUnifiedHistoryEnabled();
   let updated = removeManagedCodexProviders(content);
-  updated = updateTopLevelTomlKey(updated, "model_provider", provider.id);
+  if (unifyOn && hasCodexCustomProviderSection(updated)) {
+    throw new Error(
+      "config.toml 已存在手动定义的 [model_providers.custom] 段；为避免把流量路由到未知后端，请先删除该段，或关闭“统一 Codex 会话历史”。"
+    );
+  }
+  updated = updateTopLevelTomlKey(
+    updated,
+    "model_provider",
+    unifyOn ? CODEX_UNIFIED_PROVIDER_ID : provider.id
+  );
   updated = updateTopLevelTomlKey(updated, "model_catalog_json", CODEX_MODEL_CATALOG_FILE);
   updated = updateTopLevelTomlKey(updated, "model", selectedModel);
-  updated = `${updated.trimEnd()}\n\n${serializeManagedCodexProviders(providers)}\n`;
-  await writeCodexConfigurationFile(updated);
+  await writeCodexConfigurationFile(
+    replaceManagedCodexProviders(updated, serializeManagedCodexProviders(providers, unifyOn ? provider : undefined))
+  );
 }
 
 async function writeCodexModelCatalog(models: string[]): Promise<void> {
@@ -2537,7 +3312,10 @@ function queryWindowsInternetProxy(): Promise<string | undefined> {
   });
 }
 
-function serializeManagedCodexProviders(providers: CodexProviderProfile[]): string {
+function serializeManagedCodexProviders(
+  providers: CodexProviderProfile[],
+  unified?: CodexProviderProfile | "official"
+): string {
   const providerBlocks = providers.map((provider) => {
     const keyFile = getCodexApiKeyFile(provider);
     const auth = createCodexAuthConfig(process.platform, CODEX_AUTH_HELPER_FILE, keyFile);
@@ -2552,6 +3330,18 @@ function serializeManagedCodexProviders(providers: CodexProviderProfile[]): stri
       `args = [${auth.args.map((argument) => JSON.stringify(argument)).join(", ")}]`
     ].join("\n");
   });
+  if (unified === "official") {
+    providerBlocks.push(serializeCodexUnifiedOfficialBlock());
+  } else if (unified) {
+    const keyFile = getCodexApiKeyFile(unified);
+    const auth = createCodexAuthConfig(process.platform, CODEX_AUTH_HELPER_FILE, keyFile);
+    providerBlocks.push(
+      serializeCodexUnifiedProviderBlock(
+        { name: unified.name, baseUrl: getCodexApiBaseUrl(unified.baseUrl) },
+        auth
+      )
+    );
+  }
   return [CODEX_MANAGED_BEGIN, ...providerBlocks, CODEX_MANAGED_END].join("\n");
 }
 
