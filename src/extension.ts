@@ -57,6 +57,12 @@ import {
   planProviderEdit
 } from "./providerEdit";
 import {
+  describeGatewayModelFailure,
+  getGatewayModelEndpoints,
+  isGatewayModelPathMiss,
+  parseGatewayModelList
+} from "./gatewayModels";
+import {
   ProviderUsageConfiguration,
   ProviderUsageSnapshot,
   formatProviderUsageSummary,
@@ -73,6 +79,7 @@ import {
   CLAUDE_MODEL_ENV_NAMES,
   CLAUDE_PROVIDER_ENV_NAMES,
   DEEPSEEK_CLAUDE_MODEL_ENV_NAMES,
+  clearClaudeManagedJsonEnv,
   createClaudeModelEnvironment,
   createClaudeModelMapping,
   findClaudeProviderByEnvironment,
@@ -82,11 +89,43 @@ import {
   inspectClaudeSettingsJson,
   isDeepSeekAnthropicApi,
   isClaudeAutoClassifierCompatible,
+  mergeClaudeJsonEnv,
   normalizeClaudeModelMapping,
   normalizeClaudePermissionStrategy,
   normalizeClaudeProviderBaseUrl,
   stripClaudeProviderSettingsJson
 } from "./claudeConfig";
+import {
+  applyClaudeDesktopEntry,
+  buildClaudeDesktopGatewayConfig,
+  CLAUDE_DESKTOP_ALIAS_MODELS,
+  buildClaudeDesktopAliasEntries,
+  buildClaudeDesktopModelEntries,
+  isClaudeDesktopCompatibleModel,
+  CLAUDE_DESKTOP_1P_MODE,
+  CLAUDE_DESKTOP_3P_MODE,
+  findClaudeDesktopInstall,
+  getClaudeDesktopEntryFile,
+  getClaudeDesktopRootCandidates,
+  getClaudeDesktopWriteLayouts,
+  parseClaudeDesktopMeta,
+  readClaudeDesktopGateway,
+  readOptionalFile,
+  removeClaudeDesktopEntry,
+  serializeClaudeDesktopMeta,
+  setClaudeDesktopDeploymentMode,
+  toClaudeDesktopEntryId,
+  type ClaudeDesktopInstall,
+  type ClaudeDesktopLayout,
+  type ClaudeDesktopModelEntry
+} from "./claudeDesktop";
+import {
+  describeRemoteConfigScope,
+  describeRemoteDesktopLimit,
+  describeRemoteEnvironment,
+  describeRemoteProxyRisk,
+  type RemoteEnvironment
+} from "./remoteEnvironment";
 
 type EnvVar = { name: string; value: string };
 type GatewayProfile = {
@@ -96,6 +135,11 @@ type GatewayProfile = {
   modelMapping?: ClaudeModelMapping;
   permissionStrategy?: ClaudePermissionStrategy;
   usage?: ProviderUsageConfiguration;
+  /**
+   * Anthropic-style IDs to offer Claude Desktop instead of the gateway's own
+   * model names, for gateways whose real names the desktop app refuses.
+   */
+  desktopModels?: string[];
 };
 type GatewayModels = { gatewayId: string; models: string[]; updatedAt: string };
 type CodexProviderProfile = { id: string; name: string; baseUrl: string; usage?: ProviderUsageConfiguration };
@@ -114,6 +158,8 @@ const CLAUDE_ALLOW_BYPASS_KEY = "claudeCode.allowDangerouslySkipPermissions";
 const GATEWAYS_KEY = "aiProviderSwitcher.gateways";
 const GATEWAY_MODELS_KEY = "gatewayModels";
 const CLAUDE_ACTIVE_PROVIDER_KEY = "claudeActiveProviderId";
+const CLAUDE_DESKTOP_ROOT_KEY = "claudeDesktopConfigRoot";
+const CLAUDE_USER_SETTINGS_FILE = path.join(os.homedir(), ".claude", "settings.json");
 const CODEX_SECRET_KEY_PREFIX = "aiProviderSwitcher.codex.apiKey.";
 const CODEX_PROVIDERS_KEY = "codexProviders";
 const CODEX_MODELS_KEY = "codexModels";
@@ -154,6 +200,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("aiProviderSwitcher.openManager", () => openProviderManager(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.useOfficial", () => switchToOfficial()),
     vscode.commands.registerCommand("aiProviderSwitcher.useGateway", () => switchToGateway(context)),
+    vscode.commands.registerCommand("aiProviderSwitcher.switchClaudeDesktop", () =>
+      switchClaudeDesktop(context)
+    ),
     vscode.commands.registerCommand("aiProviderSwitcher.manageGateways", () => manageGateways(context)),
     vscode.commands.registerCommand("aiProviderSwitcher.addGateway", () => addGateway()),
     vscode.commands.registerCommand("aiProviderSwitcher.editGateway", () => editGateway(context)),
@@ -169,6 +218,9 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("aiProviderSwitcher.configureClaudePermissions", () =>
       configureClaudePermissionStrategy()
+    ),
+    vscode.commands.registerCommand("aiProviderSwitcher.configureClaudeDesktopModels", () =>
+      configureClaudeDesktopModels()
     ),
     vscode.commands.registerCommand("aiProviderSwitcher.inspectClaudeConfiguration", () =>
       inspectClaudeConfiguration()
@@ -319,12 +371,24 @@ function openProviderManager(
   context: vscode.ExtensionContext,
   focus?: { kind: "claude" | "codex"; id: string; edit?: boolean }
 ): void {
+  // The desktop state lives on disk, so the first paint uses the last snapshot
+  // and a fresh read re-paints the panel as soon as it resolves.
+  void refreshClaudeDesktopSnapshot().then(() => ProviderManagerPanel.refresh());
   ProviderManagerPanel.show(
     context.extensionUri,
     () => getProviderManagerState(),
     async (message) => handleProviderManagerAction(context, message),
     focus
   );
+}
+
+/**
+ * Which machine this extension host is running on. In a Remote-SSH / WSL /
+ * container window every path the extension touches is the remote host's, so
+ * most user-facing messages need to say so.
+ */
+function getRemoteEnvironment(): RemoteEnvironment {
+  return describeRemoteEnvironment(vscode.env.remoteName);
 }
 
 function getProviderManagerState(): ProviderManagerState {
@@ -336,6 +400,9 @@ function getProviderManagerState(): ProviderManagerState {
   return {
     claudeMode: currentClaudeProvider?.name ?? (getCurrentMode() === ProviderMode.Official ? "官方服务" : "未识别的自定义服务"),
     claudeOfficial: getCurrentMode() === ProviderMode.Official,
+    claudeDesktopMode: claudeDesktopSnapshot.label,
+    claudeDesktopOfficial: claudeDesktopSnapshot.official,
+    remoteNotice: describeRemoteConfigScope(getRemoteEnvironment().kind),
     claudeProviders: getGateways().map((provider) => ({
       id: provider.id,
       name: provider.name,
@@ -456,6 +523,7 @@ async function handleProviderManagerAction(
     await switchToGateway(context, provider);
   }
   if (action === "claudeOfficial") await switchToOfficial();
+  if (action === "switchClaudeDesktop") await switchClaudeDesktop(context);
   if (action === "manageClaude") await manageGateways(context);
   if (action === "inspectClaude") await inspectClaudeConfiguration();
   if (action === "refreshClaude") await refreshGatewayModels(context, message.providerKind === "claude" ? getGateways().find((item) => item.id === message.providerId) : undefined);
@@ -540,6 +608,7 @@ async function saveClaudeProviderEdit(
       merged.push(...createClaudeModelEnvironment(updated.modelMapping));
     }
     await updateClaudeEnvVars(merged);
+    await syncClaudeUserSettingsEnv(merged);
   }
 
   await refreshStatusBar();
@@ -686,6 +755,16 @@ async function switchToOfficial(): Promise<void> {
 
   const updated = clearClaudeProviderEnvVars(getClaudeEnvVars());
   await updateClaudeEnvVars(updated);
+  // Only now that the switch is committed: an earlier strip would have left the
+  // terminal CLI unconfigured whenever the user backed out above.
+  try {
+    await clearClaudeUserSettingsManagedEnv();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    vscode.window.showWarningMessage(
+      `已切换到官方订阅，但清理终端 CLI 配置（~/.claude/settings.json）失败：${message}`
+    );
+  }
 
   const claudeConfig = vscode.workspace.getConfiguration();
   await claudeConfig.update(CLAUDE_LOGIN_PROMPT_KEY, false, vscode.ConfigurationTarget.Global);
@@ -700,7 +779,7 @@ async function switchToOfficial(): Promise<void> {
   }
 
   await refreshStatusBar();
-  await offerReload("Claude 已切换到官方订阅模式。需要重新加载 VS Code 才会让 Claude Code 使用官方订阅。是否立即重载？");
+  await offerReload("Claude 已切换到官方订阅模式。需要重新加载 VS Code 才会让 Claude Code 使用官方订阅（终端 CLI 在下次启动时同步生效）。是否立即重载？");
 }
 
 async function switchToGateway(
@@ -757,6 +836,7 @@ async function switchToGateway(
     merged.push(...createClaudeModelEnvironment(modelMapping));
   }
   await updateClaudeEnvVars(merged);
+  await syncClaudeUserSettingsEnv(merged);
 
   const disablePrompt = settings.get<boolean>("disableLoginPromptInGateway", true);
   const claudeConfig = vscode.workspace.getConfiguration();
@@ -784,7 +864,7 @@ async function switchToGateway(
       "已应用 DeepSeek 官方模型映射。Auto 模式需要额外的安全分类请求；若该请求不可用，请切换到“编辑自动接受”或“手动”模式。"
     );
   }
-  await offerReload(`Claude 已切换到“${gateway.name}”。需要重新加载 VS Code 才会让 Claude Code 使用该服务。是否立即重载？`);
+  await offerReload(`Claude 已切换到“${gateway.name}”。需要重新加载 VS Code 才会让 Claude Code 使用该服务（终端 CLI 在下次启动时同步生效）。是否立即重载？`);
 }
 
 async function chooseClaudePermissionStrategy(
@@ -888,7 +968,621 @@ async function updateClaudeUserDefaultPermissionMode(
   if (existed) {
     await fs.copyFile(file, `${file}.ai-provider-switcher-${formatBackupTimestamp()}.bak`);
   }
-  await fs.writeFile(file, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  await writeJsonFileAtomic(file, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+async function writeJsonFileAtomic(filePath: string, content: string): Promise<void> {
+  const temp = `${filePath}.ai-provider-switcher-${process.pid}-${Date.now()}.tmp`;
+  await fs.writeFile(temp, content, "utf8");
+  try {
+    await fs.rename(temp, filePath);
+  } catch (error) {
+    await fs.unlink(temp).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Narrows an env list down to what may be written into a Claude JSON config.
+ *
+ * Only managed keys are written: the VS Code list also holds whatever else the
+ * user put there (proxies, CA bundles, feature flags), and copying those into
+ * ~/.claude/settings.json would leave residue no later switch can clean up,
+ * because only managed keys are ever removed again.
+ *
+ * Empty values are neutralizers for the VS Code configuration, but a JSON config
+ * with an empty ANTHROPIC_BASE_URL would be read as a broken endpoint, so blank
+ * entries are dropped rather than written.
+ */
+function filterWritableClaudeEnv(envVars: EnvVar[]): EnvVar[] {
+  return envVars.filter(
+    (entry) => MANAGED_ENV_KEYS.has(entry.name.trim()) && entry.value.trim().length > 0
+  );
+}
+
+/**
+ * Syncs the managed env keys into ~/.claude/settings.json so the standalone
+ * `claude` CLI shares the same gateway as the VS Code integration. Unrelated
+ * env entries and every other settings key are preserved.
+ */
+async function applyClaudeUserSettingsEnv(envVars: EnvVar[]): Promise<void> {
+  const file = CLAUDE_USER_SETTINGS_FILE;
+  let original = "{}\n";
+  let existed = true;
+  try {
+    original = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") throw error;
+    existed = false;
+  }
+  const { content, changed } = mergeClaudeJsonEnv(
+    original,
+    MANAGED_ENV_KEYS,
+    filterWritableClaudeEnv(envVars),
+    "Claude 用户 settings.json"
+  );
+  if (!changed) return;
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  if (existed) {
+    await fs.copyFile(file, `${file}.ai-provider-switcher-${formatBackupTimestamp()}.bak`);
+  }
+  await writeJsonFileAtomic(file, content);
+}
+
+/**
+ * Keeps the terminal CLI in step with whatever was just written to VS Code. Every
+ * path that rewrites the live configuration has to call this, otherwise `claude`
+ * in a terminal keeps talking to the previous endpoint or model set while the
+ * editor reports success. A failure here is a warning, not an abort: the VS Code
+ * side is already committed by the time it runs.
+ */
+async function syncClaudeUserSettingsEnv(envVars: EnvVar[]): Promise<void> {
+  try {
+    await applyClaudeUserSettingsEnv(envVars);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    vscode.window.showWarningMessage(
+      `已在 VS Code 中生效，但同步终端 CLI 配置（~/.claude/settings.json）失败：${message}`
+    );
+  }
+}
+
+/** Removes the plugin's own managed env from ~/.claude/settings.json. */
+async function clearClaudeUserSettingsManagedEnv(): Promise<void> {
+  const file = CLAUDE_USER_SETTINGS_FILE;
+  let original: string;
+  try {
+    original = await fs.readFile(file, "utf8");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return;
+    throw error;
+  }
+  const { content, changed } = clearClaudeManagedJsonEnv(
+    original,
+    MANAGED_ENV_KEYS,
+    "Claude 用户 settings.json"
+  );
+  if (!changed) return;
+  await fs.copyFile(file, `${file}.ai-provider-switcher-${formatBackupTimestamp()}.bak`);
+  await writeJsonFileAtomic(file, content);
+}
+
+/**
+ * Where Claude Desktop lives on this machine. The configured root wins so an
+ * unusual install (portable build, redirected AppData, another drive) can be
+ * pointed at by hand; otherwise every platform default is probed.
+ */
+async function locateClaudeDesktopInstall(): Promise<ClaudeDesktopInstall | undefined> {
+  const configured = vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .get<string>(CLAUDE_DESKTOP_ROOT_KEY, "")
+    .trim();
+  const candidates = [
+    ...(configured ? [configured] : []),
+    ...getClaudeDesktopRootCandidates(process.platform)
+  ];
+  return findClaudeDesktopInstall(candidates, process.platform);
+}
+
+/**
+ * Asks for the directory holding claude_desktop_config.json and remembers it.
+ * Auto-detection covers the documented locations, but the app is shipped in
+ * enough variants that a manual answer has to stay available.
+ */
+async function pickClaudeDesktopRoot(): Promise<ClaudeDesktopInstall | undefined> {
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    title: "选择 Claude Desktop 数据目录（包含 claude_desktop_config.json 的那一层）",
+    openLabel: "使用此目录"
+  });
+  const root = picked?.[0]?.fsPath;
+  if (!root) return undefined;
+  const install = await findClaudeDesktopInstall([root], process.platform);
+  if (!install) {
+    vscode.window.showErrorMessage(
+      `“${root}”下没有找到 Claude Desktop 数据目录。请选择包含 claude_desktop_config.json 的目录（Windows 通常在 %LOCALAPPDATA%\\Claude，macOS 在 ~/Library/Application Support/Claude）。`
+    );
+    return undefined;
+  }
+  await vscode.workspace
+    .getConfiguration("aiProviderSwitcher")
+    .update(CLAUDE_DESKTOP_ROOT_KEY, root, vscode.ConfigurationTarget.Global);
+  return install;
+}
+
+/** Resolves the install, offering the manual picker when nothing was detected. */
+async function requireClaudeDesktopInstall(): Promise<ClaudeDesktopInstall | undefined> {
+  const detected = await locateClaudeDesktopInstall();
+  if (detected) return detected;
+  const probed = getClaudeDesktopRootCandidates(process.platform);
+  // In a remote window the probe searched the remote host, where a local GUI app
+  // was never going to be. Explain that instead of blaming the install.
+  const remoteLimit = describeRemoteDesktopLimit(getRemoteEnvironment().kind);
+  if (remoteLimit) {
+    const remoteChoice = await vscode.window.showWarningMessage(
+      `未检测到 Claude Desktop 的数据目录。${remoteLimit}已尝试：${probed.join("、")}。`,
+      "打开 remote.extensionKind 设置",
+      "仍要手动指定目录",
+      "取消"
+    );
+    if (remoteChoice === "打开 remote.extensionKind 设置") {
+      await vscode.commands.executeCommand("workbench.action.openSettings", "remote.extensionKind");
+      return undefined;
+    }
+    if (remoteChoice !== "仍要手动指定目录") return undefined;
+    return pickClaudeDesktopRoot();
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `未检测到 Claude Desktop 的数据目录。已尝试：${probed.join("、")}。如果应用装在别处，可以手动指定。`,
+    "手动指定目录",
+    "取消"
+  );
+  if (choice !== "手动指定目录") return undefined;
+  return pickClaudeDesktopRoot();
+}
+
+/**
+ * `getProviderManagerState` and the status bar are synchronous, but the desktop
+ * state only exists on disk, so it is snapshotted here and refreshed alongside
+ * every other status update.
+ */
+let claudeDesktopSnapshot: { label: string; official: boolean } = {
+  label: "未检测到",
+  official: true
+};
+
+async function refreshClaudeDesktopSnapshot(): Promise<void> {
+  try {
+    const install = await locateClaudeDesktopInstall();
+    if (!install) {
+      claudeDesktopSnapshot = { label: "未检测到", official: true };
+      return;
+    }
+    const gateway = await readClaudeDesktopGateway(install, process.platform);
+    if (!gateway) {
+      claudeDesktopSnapshot = { label: "官方服务", official: true };
+      return;
+    }
+    const provider = findClaudeProviderByEnvironment(
+      [{ name: "ANTHROPIC_BASE_URL", value: gateway.baseUrl }],
+      getGateways()
+    );
+    claudeDesktopSnapshot = {
+      label: provider?.name || gateway.entryName || "未识别的自定义服务",
+      official: false
+    };
+  } catch {
+    // A malformed desktop config must not break the panel or the status bar.
+    claudeDesktopSnapshot = { label: "读取失败", official: true };
+  }
+}
+
+/**
+ * Writes one JSON file into every profile directory, since builds disagree on
+ * which one they read. Existing files are backed up before being replaced.
+ */
+async function writeClaudeDesktopFile(
+  file: string,
+  content: string
+): Promise<void> {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const existing = await readOptionalFile(file);
+  if (existing === content) return;
+  if (existing !== undefined) {
+    await fs.copyFile(file, `${file}.ai-provider-switcher-${formatBackupTimestamp()}.bak`);
+  }
+  await writeJsonFileAtomic(file, content);
+}
+
+/**
+ * Mirrors `deploymentMode` into the bootstrap document — the app's documented
+ * entry point, created when absent — and into any profile document that already
+ * exists. A profile document is never fabricated: its other keys are the app's.
+ */
+async function setClaudeDesktopMode(install: ClaudeDesktopInstall, mode: string): Promise<void> {
+  const layouts = getClaudeDesktopWriteLayouts(install.root, process.platform);
+  const bootstrap = layouts[0].bootstrapFile;
+  const files = [bootstrap, ...layouts.map((layout) => layout.profileConfigFile)];
+  for (const file of new Set(files)) {
+    const original = await readOptionalFile(file);
+    if (original === undefined && file !== bootstrap) continue;
+    const { content } = setClaudeDesktopDeploymentMode(original, mode);
+    await writeClaudeDesktopFile(file, content);
+  }
+}
+
+/**
+ * Profile directories whose config library has to stay in sync. The `-3p`
+ * directory is authoritative; the plain one is only touched when a build already
+ * created a library there, so the gateway key is not copied around needlessly.
+ */
+async function getClaudeDesktopLibraryLayouts(
+  install: ClaudeDesktopInstall
+): Promise<ClaudeDesktopLayout[]> {
+  const [plain, threeP] = getClaudeDesktopWriteLayouts(install.root, process.platform);
+  const layouts = [threeP];
+  if ((await readOptionalFile(plain.metaFile)) !== undefined) layouts.push(plain);
+  return layouts;
+}
+
+/**
+ * The model list Claude Desktop should offer for a gateway, with the tier hints
+ * taken from the provider's model mapping so `sonnet`-style aliases resolve the
+ * same way they do in VS Code. A gateway carrying explicit desktop aliases uses
+ * those instead of its discovered names, which is the only way to reach a
+ * provider whose real model IDs the desktop app refuses.
+ */
+function getClaudeDesktopModelEntries(gateway: GatewayProfile): {
+  entries: ClaudeDesktopModelEntry[];
+  rejected: string[];
+} {
+  if (gateway.desktopModels?.length) {
+    return buildClaudeDesktopAliasEntries(gateway.desktopModels, gateway.name);
+  }
+  const models = getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? [];
+  const mapping = normalizeClaudeModelMapping(gateway.modelMapping);
+  return buildClaudeDesktopModelEntries(models, {
+    defaultModel: mapping?.mainModel,
+    opus: mapping?.opusModel,
+    sonnet: mapping?.sonnetModel,
+    haiku: mapping?.haikuModel,
+    fable: mapping?.fableModel,
+    supports1m: mapping?.supports1m
+  });
+}
+
+/** Applies a gateway as Claude Desktop's live third-party inference config. */
+async function applyClaudeDesktopGateway(
+  install: ClaudeDesktopInstall,
+  gateway: GatewayProfile,
+  token: string,
+  models: ClaudeDesktopModelEntry[]
+): Promise<void> {
+  const entryId = toClaudeDesktopEntryId(gateway.id);
+  const entry = { id: entryId, name: gateway.name };
+  for (const layout of await getClaudeDesktopLibraryLayouts(install)) {
+    const meta = parseClaudeDesktopMeta(await readOptionalFile(layout.metaFile));
+    const entryFile = getClaudeDesktopEntryFile(layout, entryId, process.platform);
+    const inherited = meta.appliedId && meta.appliedId !== entryId
+      ? await readOptionalFile(getClaudeDesktopEntryFile(layout, meta.appliedId, process.platform))
+      : undefined;
+    await writeClaudeDesktopFile(
+      entryFile,
+      buildClaudeDesktopGatewayConfig(
+        await readOptionalFile(entryFile),
+        { baseUrl: gateway.baseUrl, apiKey: token, models },
+        inherited
+      )
+    );
+    await writeClaudeDesktopFile(
+      layout.metaFile,
+      serializeClaudeDesktopMeta(applyClaudeDesktopEntry(meta, entry))
+    );
+  }
+  await setClaudeDesktopMode(install, CLAUDE_DESKTOP_3P_MODE);
+}
+
+/**
+ * Deletes a provider's stored desktop config. Called both when switching back to
+ * the official subscription and when the provider is removed, so its base URL and
+ * plaintext key do not linger in the desktop config library.
+ */
+async function forgetClaudeDesktopProvider(
+  install: ClaudeDesktopInstall,
+  providerId: string
+): Promise<boolean> {
+  const entryId = toClaudeDesktopEntryId(providerId);
+  let removed = false;
+  for (const layout of await getClaudeDesktopLibraryLayouts(install)) {
+    const original = await readOptionalFile(layout.metaFile);
+    const entryFile = getClaudeDesktopEntryFile(layout, entryId, process.platform);
+    if (await readOptionalFile(entryFile) !== undefined) {
+      await fs.unlink(entryFile).catch(() => undefined);
+      removed = true;
+    }
+    if (original === undefined) continue;
+    const meta = parseClaudeDesktopMeta(original);
+    if (!meta.entries.some((item) => item.id === entryId) && meta.appliedId !== entryId) continue;
+    await writeClaudeDesktopFile(
+      layout.metaFile,
+      serializeClaudeDesktopMeta(removeClaudeDesktopEntry(meta, entryId))
+    );
+    removed = true;
+  }
+  return removed;
+}
+
+/** Best-effort cleanup when a Claude provider is deleted from the extension. */
+async function detachRemovedProviderFromClaudeDesktop(providerId: string): Promise<void> {
+  try {
+    const install = await locateClaudeDesktopInstall();
+    if (!install) return;
+    const live = await readClaudeDesktopGateway(install, process.platform);
+    const wasLive = live?.entryId === toClaudeDesktopEntryId(providerId);
+    const removed = await forgetClaudeDesktopProvider(install, providerId);
+    if (wasLive) await setClaudeDesktopMode(install, CLAUDE_DESKTOP_1P_MODE);
+    if (removed) {
+      vscode.window.showInformationMessage(
+        wasLive
+          ? "该服务是 Claude Desktop 当前使用的配置，已同时移除并恢复官方订阅。请重启 Claude Desktop。"
+          : "已同时清理该服务在 Claude Desktop 中的配置。"
+      );
+    }
+  } catch {
+    // Deleting a provider must succeed even when the desktop config cannot be touched.
+  }
+}
+
+/**
+ * The Claude Desktop app is managed independently of VS Code and the CLI: it
+ * routes through its own third-party inference config library, so switching it
+ * rewrites `configLibrary` and flips `deploymentMode` rather than touching any
+ * environment variable.
+ */
+async function switchClaudeDesktop(context: vscode.ExtensionContext): Promise<void> {
+  const install = await requireClaudeDesktopInstall();
+  if (!install) return;
+
+  const live = await readClaudeDesktopGateway(install, process.platform).catch(() => undefined);
+  const liveProvider = live
+    ? findClaudeProviderByEnvironment(
+        [{ name: "ANTHROPIC_BASE_URL", value: live.baseUrl }],
+        getGateways()
+      )
+    : undefined;
+  const gateways = getGateways();
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "官方订阅",
+        description: live ? "" : "当前",
+        target: "official" as const,
+        gateway: undefined
+      },
+      ...gateways.map((gateway) => ({
+        label: gateway.name,
+        description: `${gateway.baseUrl}${gateway.id === liveProvider?.id ? " · 当前" : ""}`,
+        target: "gateway" as const,
+        gateway
+      })),
+      ...(gateways.length === 0
+        ? [{ label: "$(add) 添加中转站…", description: "还没有可用的中转站", target: "add" as const, gateway: undefined }]
+        : []),
+      {
+        label: "$(folder-opened) 更改 Claude Desktop 数据目录…",
+        description: install.root,
+        target: "relocate" as const,
+        gateway: undefined
+      }
+    ],
+    {
+      title: "切换 Claude Desktop 服务（独立于 VS Code 与 CLI）",
+      placeHolder: live
+        ? `当前：${liveProvider?.name || live.entryName || live.baseUrl}`
+        : "当前：官方订阅"
+    }
+  );
+  if (!selected) return;
+  if (selected.target === "add") {
+    const added = await addGateway();
+    if (added) await switchClaudeDesktop(context);
+    return;
+  }
+  if (selected.target === "relocate") {
+    if (await pickClaudeDesktopRoot()) {
+      await refreshStatusBar();
+      await switchClaudeDesktop(context);
+    }
+    return;
+  }
+
+  if (selected.target === "official") {
+    const proceed = await confirmClaudeDesktopSwitch("官方订阅");
+    if (!proceed) return;
+    try {
+      if (liveProvider) await forgetClaudeDesktopProvider(install, liveProvider.id);
+      await setClaudeDesktopMode(install, CLAUDE_DESKTOP_1P_MODE);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      vscode.window.showErrorMessage(`切换 Claude Desktop 失败：${message}`);
+      return;
+    }
+    await refreshStatusBar();
+    vscode.window.showInformationMessage(
+      "Claude Desktop 已恢复官方订阅。请完全退出并重启 Claude Desktop 应用（含托盘图标）后生效。"
+    );
+    return;
+  }
+
+  const gateway = selected.gateway;
+  if (!gateway) return;
+  const proceed = await confirmClaudeDesktopSwitch(gateway.name);
+  if (!proceed) return;
+  const { entries, rejected } = getClaudeDesktopModelEntries(gateway);
+  if (!(await confirmClaudeDesktopModels(context, gateway, entries, rejected))) return;
+  const token = await getOrRequestGatewayToken(context, gateway);
+  if (!token) return;
+  try {
+    await applyClaudeDesktopGateway(install, gateway, token, entries);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "未知错误";
+    vscode.window.showErrorMessage(`切换 Claude Desktop 失败：${message}`);
+    return;
+  }
+  await refreshStatusBar();
+  vscode.window.showInformationMessage(
+    `Claude Desktop 已切换到“${gateway.name}”。请完全退出并重启 Claude Desktop 应用（含托盘图标）后生效。`
+  );
+}
+
+/**
+ * Claude Desktop only offers models it was given: it discovers them from the
+ * gateway's `/v1/models`, and most relays do not serve that endpoint, which is
+ * what leaves the picker empty and the app reporting that the model list has not
+ * loaded. Writing an explicit list skips discovery — but the app also refuses any
+ * model ID that does not read as an Anthropic route, so a provider serving its
+ * own model names (DeepSeek, Qwen, GLM…) cannot be offered at all. Both cases are
+ * explained here rather than after a restart.
+ */
+async function confirmClaudeDesktopModels(
+  context: vscode.ExtensionContext,
+  gateway: GatewayProfile,
+  entries: ClaudeDesktopModelEntry[],
+  rejected: string[]
+): Promise<boolean> {
+  if (entries.length > 0) {
+    if (rejected.length > 0) {
+      vscode.window.showWarningMessage(
+        `Claude Desktop 不接受这些模型 ID：${rejected.join("、")}。它们已被跳过，桌面应用只会提供 ${entries.length} 个 Claude 系模型。`
+      );
+    }
+    return true;
+  }
+
+  const detail = rejected.length > 0
+    ? `“${gateway.name}”的模型（${rejected.join("、")}）不是 Anthropic 系名称，Claude Desktop 会拒绝整份配置。`
+    : `还没有缓存“${gateway.name}”的模型列表，而该网关多半不提供 /v1/models，桌面应用将无法列出任何模型。`;
+  const choice = await vscode.window.showWarningMessage(
+    `${detail}\n\n桌面应用只接受名称中含 claude/opus/sonnet/haiku/anthropic 的模型 ID。若该网关本身能识别 Claude 模型名（DeepSeek 等 Anthropic 兼容端点都可以），可以改用标准 Claude 名称接入。`,
+    { modal: true },
+    "使用标准 Claude 模型名",
+    "手动填写模型名",
+    "刷新模型列表"
+  );
+  if (choice === "使用标准 Claude 模型名") {
+    return applyClaudeDesktopAliases(gateway, [...CLAUDE_DESKTOP_ALIAS_MODELS]);
+  }
+  if (choice === "手动填写模型名") {
+    const names = await promptClaudeDesktopAliases(gateway);
+    return names ? applyClaudeDesktopAliases(gateway, names) : false;
+  }
+  if (choice === "刷新模型列表") {
+    await refreshGatewayModels(context, gateway);
+    return false;
+  }
+  return false;
+}
+
+/** Stores the aliases on the gateway so later switches reuse them silently. */
+async function applyClaudeDesktopAliases(
+  gateway: GatewayProfile,
+  names: string[]
+): Promise<boolean> {
+  const { entries, rejected } = buildClaudeDesktopAliasEntries(names, gateway.name);
+  if (entries.length === 0) {
+    vscode.window.showErrorMessage(
+      `这些名称 Claude Desktop 都不接受：${rejected.join("、")}。名称中需要含 claude/opus/sonnet/haiku/anthropic。`
+    );
+    return false;
+  }
+  await saveGatewayDesktopModels(gateway.id, entries.map((entry) => entry.name));
+  gateway.desktopModels = entries.map((entry) => entry.name);
+  if (rejected.length > 0) {
+    vscode.window.showWarningMessage(`已跳过 Claude Desktop 不接受的名称：${rejected.join("、")}。`);
+  }
+  return true;
+}
+
+async function saveGatewayDesktopModels(gatewayId: string, names: string[]): Promise<void> {
+  const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const raw = settings.get<unknown>("gateways", []);
+  if (!Array.isArray(raw)) return;
+  const next = raw.map((item) => {
+    if (typeof item !== "object" || item === null) return item;
+    const record = item as Record<string, unknown>;
+    if (String(record.id ?? "").trim() !== gatewayId) return item;
+    if (names.length === 0) {
+      const { desktopModels: _dropped, ...rest } = record;
+      return rest;
+    }
+    return { ...record, desktopModels: names };
+  });
+  await settings.update("gateways", next, vscode.ConfigurationTarget.Global);
+}
+
+async function promptClaudeDesktopAliases(gateway: GatewayProfile): Promise<string[] | undefined> {
+  const value = await vscode.window.showInputBox({
+    title: `Claude Desktop 模型名 — ${gateway.name}`,
+    prompt: "用逗号分隔。这些名称会原样发给网关，由网关自行路由到它真正的模型。",
+    value: (gateway.desktopModels ?? [...CLAUDE_DESKTOP_ALIAS_MODELS]).join(", "),
+    validateInput: (input) => {
+      const names = input.split(/[,，]/).map((name) => name.trim()).filter(Boolean);
+      if (names.length === 0) return "请至少填写一个模型名";
+      const bad = names.filter((name) => !isClaudeDesktopCompatibleModel(name));
+      return bad.length > 0 ? `Claude Desktop 不接受：${bad.join("、")}` : undefined;
+    }
+  });
+  if (value === undefined) return undefined;
+  return value.split(/[,，]/).map((name) => name.trim()).filter(Boolean);
+}
+
+/** Lets a gateway's desktop model names be set without switching to it. */
+async function configureClaudeDesktopModels(gateway?: GatewayProfile): Promise<void> {
+  const target = gateway ?? (await pickGateway());
+  if (!target) return;
+  const current = target.desktopModels?.length
+    ? `当前：${target.desktopModels.join("、")}`
+    : "当前：自动使用刷新到的模型列表";
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: "使用标准 Claude 模型名", description: CLAUDE_DESKTOP_ALIAS_MODELS.join("、") },
+      { label: "手动填写模型名", description: "自行指定要发给网关的 Claude 系名称" },
+      { label: "恢复自动发现", description: "改回使用该网关刷新到的真实模型列表" }
+    ],
+    { title: `Claude Desktop 模型名 — ${target.name}`, placeHolder: current }
+  );
+  if (!choice) return;
+  if (choice.label === "恢复自动发现") {
+    await saveGatewayDesktopModels(target.id, []);
+    vscode.window.showInformationMessage(
+      `“${target.name}”已恢复自动发现模型。重新切换 Claude Desktop 后生效。`
+    );
+    return;
+  }
+  const names = choice.label === "使用标准 Claude 模型名"
+    ? [...CLAUDE_DESKTOP_ALIAS_MODELS]
+    : await promptClaudeDesktopAliases(target);
+  if (!names) return;
+  if (!(await applyClaudeDesktopAliases(target, names))) return;
+  vscode.window.showInformationMessage(
+    `“${target.name}”的 Claude Desktop 模型名已设为 ${names.join("、")}。重新切换 Claude Desktop 后生效。`
+  );
+}
+
+/**
+ * The desktop app keeps its own conversation store, so the Claude Code session
+ * warning does not apply — only the restart requirement does.
+ */
+async function confirmClaudeDesktopSwitch(target: string): Promise<boolean> {
+  const choice = await vscode.window.showInformationMessage(
+    `准备把 Claude Desktop 切换到“${target}”。这只影响桌面应用，VS Code 与终端 CLI 不变；桌面应用需要完全退出并重启（含托盘图标）后才会生效。是否继续？`,
+    { modal: true },
+    "继续切换",
+    "取消"
+  );
+  return choice === "继续切换";
 }
 
 async function configureClaudePermissionStrategy(selectedGateway?: GatewayProfile): Promise<void> {
@@ -991,7 +1685,7 @@ async function getOrRequestGatewayToken(
 
   const entered = await vscode.window.showInputBox({
     title: "Input Gateway Token",
-    prompt: "请输入网关 Bearer Token（不会写入 settings.json，保存在 VS Code Secret Storage）",
+    prompt: "请输入网关 Bearer Token（保存在 VS Code Secret Storage；启用终端 CLI 或 Claude Desktop 同步时，会明文写入对应的本地配置文件）",
     password: true,
     ignoreFocusOut: true
   });
@@ -1035,11 +1729,13 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
     [
       { label: "切换中转站", action: "switch" },
       { label: "使用 Claude 官方订阅", action: "official" },
+      { label: "切换 Claude Desktop 服务（独立）", action: "desktop" },
       { label: "添加中转站", action: "add" },
       { label: "编辑中转站（名称 / Base URL / Token）", action: "edit" },
       { label: "删除中转站", action: "remove" },
       { label: "清除某个中转站 Token", action: "clear" },
       { label: "配置模型映射", action: "mapping" },
+      { label: "配置 Claude Desktop 模型名", action: "desktopModels" },
       { label: "配置命令执行策略", action: "permissions" },
       { label: "检测其他 Claude 配置", action: "inspect" },
       { label: "打开 Claude 会话历史", action: "sessions" }
@@ -1052,11 +1748,13 @@ async function manageGateways(context: vscode.ExtensionContext): Promise<void> {
   }
   if (action.action === "switch") await switchToGateway(context);
   if (action.action === "official") await switchToOfficial();
+  if (action.action === "desktop") await switchClaudeDesktop(context);
   if (action.action === "add") await addGateway();
   if (action.action === "edit") await editGateway(context);
   if (action.action === "remove") await removeGateway(context);
   if (action.action === "clear") await clearGatewayToken(context);
   if (action.action === "mapping") await configureClaudeModelMapping(context);
+  if (action.action === "desktopModels") await configureClaudeDesktopModels();
   if (action.action === "permissions") await configureClaudePermissionStrategy();
   if (action.action === "inspect") await inspectClaudeConfiguration();
   if (action.action === "sessions") await vscode.commands.executeCommand("workbench.action.chat.openSessions");
@@ -1083,15 +1781,26 @@ async function findClaudeConfigurationConflicts(
 
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const settingsFiles = [
-    { file: path.join(os.homedir(), ".claude", "settings.json"), source: "Claude 用户设置" },
+    // The user file's managed env keys are written by this extension, so they are
+    // filtered out in memory instead of being deleted from disk first — an
+    // abandoned switch used to leave the CLI unconfigured that way.
+    { file: CLAUDE_USER_SETTINGS_FILE, source: "Claude 用户设置", managed: true },
     ...(workspaceRoot ? [
-      { file: path.join(workspaceRoot, ".claude", "settings.json"), source: "Claude 项目设置" },
-      { file: path.join(workspaceRoot, ".claude", "settings.local.json"), source: "Claude 项目本地设置" }
+      { file: path.join(workspaceRoot, ".claude", "settings.json"), source: "Claude 项目设置", managed: false },
+      { file: path.join(workspaceRoot, ".claude", "settings.local.json"), source: "Claude 项目本地设置", managed: false }
     ] : [])
   ];
   for (const candidate of settingsFiles) {
     try {
-      const content = await fs.readFile(candidate.file, "utf8");
+      const raw = await fs.readFile(candidate.file, "utf8");
+      let content = raw;
+      if (candidate.managed) {
+        try {
+          content = clearClaudeManagedJsonEnv(raw, MANAGED_ENV_KEYS, candidate.source).content;
+        } catch {
+          // Malformed JSON is reported by the inspector below with a clearer message.
+        }
+      }
       findings.push(...inspectClaudeSettingsJson(content, candidate.source, true).map((finding) => ({
         ...finding,
         sourcePath: candidate.file
@@ -1311,6 +2020,10 @@ async function removeGateway(
     vscode.ConfigurationTarget.Global
   );
   await context.secrets.delete(`${SECRET_KEY_PREFIX}${gateway.id}`);
+  // Its base URL and plaintext key would otherwise stay in the desktop config
+  // library, still routing Claude Desktop to a provider the user just deleted.
+  await detachRemovedProviderFromClaudeDesktop(gateway.id);
+  await refreshStatusBar();
   vscode.window.showInformationMessage(`已删除中转站：${gateway.name}`);
 }
 
@@ -1393,7 +2106,9 @@ async function configureClaudeModelMapping(
   if (action.action === "clear") {
     await updateGatewayProfile({ ...gateway, modelMapping: undefined });
     if (applyImmediately && getCurrentClaudeProvider()?.id === gateway.id) {
-      await updateClaudeEnvVars(removeClaudeModelEnvironment(getClaudeEnvVars()));
+      const cleared = removeClaudeModelEnvironment(getClaudeEnvVars());
+      await updateClaudeEnvVars(cleared);
+      await syncClaudeUserSettingsEnv(cleared);
       await offerReload(`已清除“${gateway.name}”的模型映射。需要重新加载 VS Code 才会生效。是否立即重载？`);
     } else {
       vscode.window.showInformationMessage(`已清除“${gateway.name}”的模型映射。`);
@@ -1474,7 +2189,9 @@ async function configureClaudeModelMapping(
   await updateGatewayProfile({ ...gateway, modelMapping: mapping });
   if (applyImmediately && getCurrentClaudeProvider()?.id === gateway.id) {
     const current = removeClaudeModelEnvironment(getClaudeEnvVars());
-    await updateClaudeEnvVars([...current, ...createClaudeModelEnvironment(mapping)]);
+    const applied = [...current, ...createClaudeModelEnvironment(mapping)];
+    await updateClaudeEnvVars(applied);
+    await syncClaudeUserSettingsEnv(applied);
     await offerReload(`已保存并应用“${gateway.name}”的模型映射。需要重新加载 VS Code 才会生效。是否立即重载？`);
   } else {
     vscode.window.showInformationMessage(`已保存“${gateway.name}”的模型映射，下次切换到该服务时自动应用。`);
@@ -1598,11 +2315,12 @@ async function getStoredGatewayToken(
   return context.secrets.get(`${SECRET_KEY_PREFIX}${gateway.id}`);
 }
 
-function requestGatewayModels(baseUrl: string, token: string): Promise<{ models: string[]; headers: IncomingHttpHeaders }> {
-  const endpoint = new URL(`${normalizeProviderRootUrl(baseUrl)}/v1/models`);
+type GatewayModelsResponse = { models: string[]; headers: IncomingHttpHeaders };
+
+function requestGatewayModelsFrom(endpoint: string, token: string): Promise<GatewayModelsResponse> {
   return new Promise((resolve, reject) => {
     const request = https.request(
-      endpoint,
+      new URL(endpoint),
       {
         method: "GET",
         headers: {
@@ -1619,17 +2337,14 @@ function requestGatewayModels(baseUrl: string, token: string): Promise<{ models:
           body += chunk;
         });
         response.on("end", () => {
-          if (response.statusCode !== 200) {
-            reject(new Error(`HTTP ${response.statusCode ?? "unknown"}`));
+          const status = response.statusCode ?? 0;
+          if (status !== 200) {
+            reject(new Error(describeGatewayModelFailure(status, body)));
             return;
           }
 
           try {
-            const parsed = JSON.parse(body) as { data?: Array<{ id?: unknown }> };
-            const models = (parsed.data ?? [])
-              .map((item) => String(item.id ?? "").trim())
-              .filter(Boolean);
-            resolve({ models: [...new Set(models)].sort(), headers: response.headers });
+            resolve({ models: parseGatewayModelList(body), headers: response.headers });
           } catch {
             reject(new Error("网关返回的模型列表不是有效 JSON"));
           }
@@ -1643,6 +2358,24 @@ function requestGatewayModels(baseUrl: string, token: string): Promise<{ models:
     });
     request.end();
   });
+}
+
+/**
+ * Tries each candidate endpoint. A 404 only means "not here", so the search
+ * continues; anything else (401, quota, network) is the answer and is reported
+ * as-is, since the server's message names the real problem.
+ */
+async function requestGatewayModels(baseUrl: string, token: string): Promise<GatewayModelsResponse> {
+  let lastError: Error = new Error("网关没有提供模型列表接口");
+  for (const endpoint of getGatewayModelEndpoints(baseUrl)) {
+    try {
+      return await requestGatewayModelsFrom(endpoint, token);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("未知网络错误");
+      if (!isGatewayModelPathMiss(lastError.message)) throw lastError;
+    }
+  }
+  throw lastError;
 }
 
 async function saveGatewayModels(gatewayId: string, models: string[]): Promise<void> {
@@ -2443,16 +3176,13 @@ function requestCodexModels(baseUrl: string, token: string): Promise<{ models: s
           body += chunk;
         });
         response.on("end", () => {
-          if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) {
-            reject(new Error(`HTTP ${response.statusCode ?? "unknown"}`));
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            reject(new Error(describeGatewayModelFailure(status, body)));
             return;
           }
           try {
-            const parsed = JSON.parse(body) as { data?: Array<{ id?: unknown }> };
-            const models = (parsed.data ?? [])
-              .map((item) => String(item.id ?? "").trim())
-              .filter(Boolean);
-            resolve({ models: [...new Set(models)].sort(), headers: response.headers });
+            resolve({ models: parseGatewayModelList(body), headers: response.headers });
           } catch {
             reject(new Error("网关返回的 Codex 模型列表不是有效 JSON"));
           }
@@ -3031,8 +3761,27 @@ async function removeCodexProxyEnvironment(): Promise<void> {
   await fs.unlink(CODEX_ENV_FILE);
 }
 
+/**
+ * Guards the one address that means different machines on the two sides of a
+ * remote connection. Both the detected value (`http.proxy` travels with Settings
+ * Sync) and a hand-typed one can be a local address about to be written into the
+ * remote host's `~/.codex/.env`, where it resolves to nothing.
+ */
+async function confirmRemoteCodexProxy(proxyUrl: string): Promise<boolean> {
+  const risk = describeRemoteProxyRisk(getRemoteEnvironment().kind, proxyUrl);
+  if (!risk) return true;
+  const choice = await vscode.window.showWarningMessage(
+    risk,
+    { modal: true },
+    "仍然写入",
+    "取消"
+  );
+  return choice === "仍然写入";
+}
+
 async function configureCodexProxy(): Promise<void> {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const remote = getRemoteEnvironment();
   const configuredProxy = settings.get<string>(CODEX_PROXY_URL_KEY, "");
   const proxyMode = settings.get<CodexProxyMode>(CODEX_PROXY_MODE_KEY, "officialOnly");
   const detectedProxy = await detectCodexProxyUrl();
@@ -3042,13 +3791,13 @@ async function configureCodexProxy(): Promise<void> {
   const action = await vscode.window.showQuickPick(
     [
       {
-        label: "$(search) 自动检测并应用当前设备代理",
-        description: detectedProxy ?? "未检测到 HTTP(S) 系统代理，可改用手动输入",
+        label: `$(search) 自动检测并应用${remote.label}的代理`,
+        description: detectedProxy ?? `未在${remote.label}检测到 HTTP(S) 系统代理，可改用手动输入`,
         action: "detect"
       },
       {
         label: "$(edit) 设置或更新代理",
-        description: configuredProxy || "手动输入当前设备实际地址和端口",
+        description: configuredProxy || `手动输入${remote.label}能访问到的地址和端口`,
         action: "set"
       },
       {
@@ -3071,7 +3820,9 @@ async function configureCodexProxy(): Promise<void> {
     ],
     {
       title: "配置 Codex WebSocket 代理",
-      placeHolder: "同时适用于 Codex 官方服务和自定义 Provider"
+      placeHolder: remote.isRemote
+        ? `代理写入${remote.label}的 ~/.codex/.env，地址必须是该主机能访问到的`
+        : "同时适用于 Codex 官方服务和自定义 Provider"
     }
   );
   if (!action) return;
@@ -3106,10 +3857,13 @@ async function configureCodexProxy(): Promise<void> {
     if (action.action === "detect") {
       if (!detectedProxy) {
         vscode.window.showWarningMessage(
-          "未检测到当前设备的 HTTP(S) 代理。请确认系统代理已启用，或选择“设置或更新代理”手动填写。"
+          remote.isRemote
+            ? `未在${remote.label}检测到 HTTP(S) 代理。远程主机通常没有图形化的系统代理设置，可在该主机上导出 HTTPS_PROXY 环境变量后重试，或选择“设置或更新代理”手动填写。`
+            : "未检测到当前设备的 HTTP(S) 代理。请确认系统代理已启用，或选择“设置或更新代理”手动填写。"
         );
         return;
       }
+      if (!await confirmRemoteCodexProxy(detectedProxy)) return;
       if (!await confirmCodexEnvProxyConflicts(envContent, unmanagedEntries)) return;
       await applyCodexProxy(settings, detectedProxy, proxyMode);
       return;
@@ -3117,13 +3871,16 @@ async function configureCodexProxy(): Promise<void> {
     if (action.action === "set") {
       const entered = await vscode.window.showInputBox({
         title: "配置 Codex 代理地址",
-        prompt: "输入代理地址，例如 http://127.0.0.1:7890（Clash）或 http://127.0.0.1:10808（v2rayN）",
+        prompt: remote.isRemote
+          ? `输入 ${remote.label} 能访问到的代理地址；那里的 127.0.0.1 指的是该主机自己，不是你面前这台电脑`
+          : "输入代理地址，例如 http://127.0.0.1:7890（Clash）或 http://127.0.0.1:10808（v2rayN）",
         placeHolder: "http://127.0.0.1:<当前设备端口>",
         value: configuredProxy || detectedProxy || "http://127.0.0.1:",
         ignoreFocusOut: true
       });
       if (!entered?.trim()) return;
       const proxyUrl = normalizeCodexProxyUrl(entered);
+      if (!await confirmRemoteCodexProxy(proxyUrl)) return;
       if (!await confirmCodexEnvProxyConflicts(envContent, unmanagedEntries)) return;
       await applyCodexProxy(settings, proxyUrl, proxyMode);
       return;
@@ -3434,6 +4191,13 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
+/** An absent list means "discover from the gateway"; an empty one is the same. */
+function normalizeDesktopModelNames(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const names = raw.map((item) => String(item ?? "").trim()).filter(Boolean);
+  return names.length > 0 ? [...new Set(names)] : undefined;
+}
+
 function getGateways(): GatewayProfile[] {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   const raw = settings.get<unknown>("gateways", []);
@@ -3449,7 +4213,8 @@ function getGateways(): GatewayProfile[] {
         modelMapping: normalizeClaudeModelMapping(item.modelMapping) ??
           (isDeepSeekAnthropicApi(baseUrl) ? getDeepSeekClaudeModelMapping() : undefined),
         permissionStrategy: normalizeClaudePermissionStrategy(item.permissionStrategy),
-        usage: normalizeUsageConfiguration(item.usage)
+        usage: normalizeUsageConfiguration(item.usage),
+        desktopModels: normalizeDesktopModelNames(item.desktopModels)
       };
     })
     .filter((gateway) => gateway.id && gateway.name && gateway.baseUrl);
@@ -3530,6 +4295,7 @@ function findEnvValue(envVars: EnvVar[], key: string): string | undefined {
 }
 
 async function refreshStatusBar(): Promise<void> {
+  await refreshClaudeDesktopSnapshot();
   const mode = getCurrentMode();
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   const codexProviderId = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");

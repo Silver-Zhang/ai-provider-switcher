@@ -4,6 +4,7 @@ export type ProviderManagerAction =
   | "ready"
   | "switchClaude"
   | "claudeOfficial"
+  | "switchClaudeDesktop"
   | "manageClaude"
   | "refreshClaude"
   | "mapClaudeModels"
@@ -55,6 +56,13 @@ export type ProviderManagerActionResult = { keepEditing?: boolean; message?: str
 export type ProviderManagerState = {
   claudeMode: string;
   claudeOfficial: boolean;
+  claudeDesktopMode: string;
+  claudeDesktopOfficial: boolean;
+  /**
+   * Set only in a Remote-SSH / WSL / container window, where every path written
+   * belongs to the remote host rather than the machine drawing this panel.
+   */
+  remoteNotice?: string;
   claudeProviders: Array<{
     id: string;
     name: string;
@@ -107,6 +115,11 @@ export class ProviderManagerPanel {
     );
     ProviderManagerPanel.current = new ProviderManagerPanel(panel, extensionUri, getState, onAction);
     ProviderManagerPanel.current.focusProvider(focus);
+  }
+
+  /** Re-paints the open panel once state that had to be read from disk resolves. */
+  static refresh(): void {
+    ProviderManagerPanel.current?.render();
   }
 
   private selectedProvider: { kind: "claude" | "codex"; id: string } | undefined;
@@ -217,7 +230,7 @@ export class ProviderManagerPanel {
     const selected = this.selectedProvider ? findProvider(state, this.selectedProvider) : undefined;
     void this.panel.webview.postMessage({
       type: "render",
-      status: `${statusChip("Claude", state.claudeMode, state.claudeOfficial)}${statusChip("Codex", state.codexMode, state.codexOfficial)}`,
+      status: `${statusChip("Claude", state.claudeMode, state.claudeOfficial)}${statusChip("Claude Desktop", state.claudeDesktopMode, state.claudeDesktopOfficial)}${statusChip("Codex", state.codexMode, state.codexOfficial)}`,
       list: providerList(state, this.selectedProvider),
       detail: selected
         ? providerDetail(selected.kind, selected.provider, this.editing ? { draft: this.pendingDraft, notice: this.notice } : undefined)
@@ -546,10 +559,16 @@ function listSection(
 
 /** Shown when no provider is selected: the two global action sets, with nothing hidden from before. */
 function overviewPane(state: ProviderManagerState): string {
-  const claude = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">✦</span><h2>Claude</h2></div><span class="badge">${escapeHtml(state.claudeMode)}</span></div><div class="model">从左侧选择一个服务查看详情、编辑配置或配置额度。${state.claudeProviders.length ? "" : "还没有中转服务，点左侧的 ＋ 添加。"}</div>${actionBar(
+  // A remote window writes to the remote host's home directory — right for the
+  // CLIs, impossible for the local desktop app. Say so before anything else.
+  const remote = state.remoteNotice
+    ? `<div class="form-notice" role="note"><span>⧉</span><span>${escapeHtml(state.remoteNotice)}</span></div>`
+    : "";
+  const claude =`<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">✦</span><h2>Claude</h2></div><span class="badge">${escapeHtml(state.claudeMode)}</span></div><div class="model">从左侧选择一个服务查看详情、编辑配置或配置额度。${state.claudeProviders.length ? "" : "还没有中转服务，点左侧的 ＋ 添加。"}<br>终端 CLI 与 VS Code 内共用同一配置；Desktop 独立：<strong>${escapeHtml(state.claudeDesktopMode)}</strong>（切换后需完全退出并重启桌面应用）。</div>${actionBar(
     [
       { label: "快速切换", action: "switchClaude", primary: true },
       { label: "使用官方", action: "claudeOfficial" },
+      { label: "切换 Desktop 服务", action: "switchClaudeDesktop" },
       { label: "模型映射", action: "mapClaudeModels" },
       { label: "命令策略", action: "configureClaudePermissions" }
     ],
@@ -576,7 +595,7 @@ function overviewPane(state: ProviderManagerState): string {
       { label: "管理服务（命令菜单）", action: "manageCodex" }
     ]
   )}</article>`;
-  return `${claude}${codex}`;
+  return `${remote}${claude}${codex}`;
 }
 
 function detailTop(isClaude: boolean): string {

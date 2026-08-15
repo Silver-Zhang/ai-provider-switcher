@@ -1,0 +1,8 @@
+{
+  // WSL interop on this machine is currently broken, so automation (tasks)
+  // must run in a Windows shell. The interactive terminal keeps the user's
+  // default profile untouched.
+  "terminal.integrated.automationProfile.windows": {
+    "path": "C:\\WINDOWS\\System32\\cmd.exe"
+  }
+}

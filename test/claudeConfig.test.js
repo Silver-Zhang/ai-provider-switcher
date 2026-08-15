@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const {
   DEEPSEEK_CLAUDE_MODEL_ENV,
+  clearClaudeManagedJsonEnv,
   createClaudeModelEnvironment,
   createClaudeModelMapping,
   findClaudeProviderByEnvironment,
@@ -11,6 +12,7 @@ const {
   inspectClaudeSettingsJson,
   isClaudeAutoClassifierCompatible,
   isDeepSeekAnthropicApi,
+  mergeClaudeJsonEnv,
   mergeDeepSeekClaudeEnvironment,
   normalizeClaudeModelMapping,
   normalizeClaudePermissionStrategy,
@@ -223,4 +225,71 @@ test("normalizes only supported Claude permission strategies", () => {
   assert.equal(normalizeClaudePermissionStrategy("acceptEdits"), "acceptEdits");
   assert.equal(normalizeClaudePermissionStrategy("bypassPermissions"), "bypassPermissions");
   assert.equal(normalizeClaudePermissionStrategy("dangerouslySkip"), undefined);
+});
+
+test("merges managed env into a Claude JSON document preserving unrelated keys", () => {
+  const original = JSON.stringify({
+    permissions: { defaultMode: "acceptEdits" },
+    env: {
+      ANTHROPIC_BASE_URL: "https://old.example.com",
+      CUSTOM_USER_VAR: "keep-me"
+    },
+    mcpServers: { echo: { command: "echo" } }
+  }, null, 2);
+  const result = mergeClaudeJsonEnv(
+    original,
+    new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]),
+    [{ name: "ANTHROPIC_BASE_URL", value: "https://new.example.com" }]
+  );
+  assert.equal(result.changed, true);
+  const parsed = JSON.parse(result.content);
+  assert.equal(parsed.env.ANTHROPIC_BASE_URL, "https://new.example.com");
+  assert.equal(parsed.env.CUSTOM_USER_VAR, "keep-me");
+  assert.equal(parsed.env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(parsed.permissions.defaultMode, "acceptEdits");
+  assert.equal(parsed.mcpServers.echo.command, "echo");
+});
+
+test("clear removes only managed keys and drops an emptied env object", () => {
+  const original = JSON.stringify({
+    env: { ANTHROPIC_BASE_URL: "https://x", ANTHROPIC_AUTH_TOKEN: "t", USER_KEY: "v" }
+  }, null, 2);
+  const result = clearClaudeManagedJsonEnv(
+    original,
+    new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"])
+  );
+  assert.equal(result.changed, true);
+  const parsed = JSON.parse(result.content);
+  assert.deepEqual(parsed.env, { USER_KEY: "v" });
+
+  const emptied = clearClaudeManagedJsonEnv(
+    JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://x" } }, null, 2),
+    new Set(["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"])
+  );
+  assert.equal(JSON.parse(emptied.content).env, undefined);
+
+  const untouched = clearClaudeManagedJsonEnv(
+    JSON.stringify({ env: { USER_KEY: "v" } }, null, 2),
+    new Set(["ANTHROPIC_BASE_URL"])
+  );
+  assert.equal(untouched.changed, false);
+});
+
+test("merge keeps env absent when nothing is wanted and rejects broken documents", () => {
+  const absent = mergeClaudeJsonEnv(
+    JSON.stringify({ permissions: { defaultMode: "manual" } }, null, 2),
+    new Set(["ANTHROPIC_BASE_URL"]),
+    []
+  );
+  assert.equal(absent.changed, false);
+  assert.equal(JSON.parse(absent.content).env, undefined);
+
+  assert.throws(
+    () => mergeClaudeJsonEnv("not json", new Set(["ANTHROPIC_BASE_URL"]), []),
+    /JSON/
+  );
+  assert.throws(
+    () => mergeClaudeJsonEnv("[1,2,3]", new Set(["ANTHROPIC_BASE_URL"]), []),
+    /根节点/
+  );
 });

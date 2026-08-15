@@ -1,14 +1,74 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "type": "npm",
-      "script": "compile",
-      "group": "build",
-      "problemMatcher": [
-        "$tsc"
-      ],
-      "label": "npm: compile"
-    }
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "npm",
+			"script": "compile",
+			"group": "build",
+			"problemMatcher": [
+				"$tsc"
+			],
+			"label": "npm: compile"
+		},
+		{
+			"label": "ai-provider-switcher: test (windows shell)",
+			"type": "shell",
+			"command": "cd /d C:\\Users\\63409\\Desktop\\claude配置 && npm test",
+			"options": {
+				"shell": {
+					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
+					"args": [
+						"/d",
+						"/s",
+						"/c"
+					]
+				}
+			}
+		},
+		{
+			"label": "ai-provider-switcher: package (windows shell)",
+			"type": "shell",
+			"command": "cd /d C:\\Users\\63409\\Desktop\\claude配置 && npx vsce package",
+			"options": {
+				"shell": {
+					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
+					"args": [
+						"/d",
+						"/s",
+						"/c"
+					]
+				}
+			}
+		},
+		{
+			"label": "ai-provider-switcher: package and install",
+			"type": "shell",
+			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.0.vsix --force"
+		},
+		{
+			"label": "verify installed version",
+			"type": "shell",
+			"command": "code --list-extensions --show-versions | findstr /i ai-provider"
+		},
+		{
+			"label": "ai-provider-switcher: git status",
+			"type": "shell",
+			"command": "git --no-pager status --short && echo ==== && git --no-pager diff --stat --ignore-space-at-eol | tail -8"
+		},
+		{
+			"label": "ai-provider-switcher: git log",
+			"type": "shell",
+			"command": "git --no-pager log --oneline -10"
+		},
+		{
+			"label": "ai-provider-switcher: final test",
+			"type": "shell",
+			"command": "npm test"
+		},
+		{
+			"label": "ai-provider-switcher: stage and review",
+			"type": "shell",
+			"command": "git add -A && git status --short && git --no-pager diff --cached --stat | tail -30"
+		}
+	]
 }

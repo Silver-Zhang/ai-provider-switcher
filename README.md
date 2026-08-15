@@ -34,6 +34,8 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 - 同步 Codex 自定义 Provider 模型到 Codex 原生模型栏。
 - 统一 Codex 会话历史：官方订阅以共享的 custom 供应商标识运行，官方与第三方会话出现在同一历史列表（可选迁入现有会话，自动备份、可还原）。
 - 检测会覆盖当前设置的 Claude 外部配置。
+- 切换中转站时同步终端 Claude CLI（`~/.claude/settings.json` 的 env），与 VS Code 内 Claude Code 保持一致。
+- 独立管理 Claude Desktop（自动探测数据目录，也可手动指定），切换后需完全退出并重启桌面应用。
 - 管理 Codex WebSocket/HTTPS 代理，处理反复重连问题。
 - 切换后保留本地会话历史，不删除已有对话。
 
@@ -82,6 +84,7 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 
 - 在管理面板中显示自定义 Provider 的额度摘要。
 - 刷新模型时自动缓存 `x-ratelimit-*` 响应头，不额外发送收费推理请求。
+- 刷新模型会依次尝试 `<Base URL>/v1/models`、`/models`；当 Base URL 带路径（如 `https://api.deepseek.com/anthropic`）时，还会回退到同域根路径。只有 404 才继续尝试下一个地址，其余错误直接显示网关返回的原文，便于区分「密钥无效」「额度用尽」和「没有该接口」。
 - 可配置返回 JSON 的只读 GET 额度 API，并复用该 Provider 已保存的凭据。
 - 自动识别常见 `balance`、`five_hour` 和 `weekly` 字段，也可填写 JSON 字段路径。
 - 支持余额、5 小时窗口、周窗口、请求额度、Token 额度及重置时间。
@@ -90,7 +93,7 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 使用方式：运行 **AI Provider Switcher: Configure Provider Usage API** 配置接口，然后运行 **AI Provider Switcher: Refresh Provider Usage** 测试和刷新。优先使用 HTTPS 及只读凭据；如果额度 API 与 Provider 不同域，扩展会在发送已保存凭据前要求明确确认。如果服务商未提供额度 API，扩展只能显示模型接口返回的限流响应头。
 
 > [!WARNING]
-> Codex 自定义 Provider 现在支持 Windows、macOS 和 Linux。Windows 使用 PowerShell + 当前用户 DPAPI；macOS/Linux 使用权限为 `0600` 的本地 Key 文件，并通过权限为 `0700` 的 shell helper 读取。WSL/Remote 扩展宿主应在实际运行 Codex 的同一环境中安装和运行扩展。
+> Codex 自定义 Provider 现在支持 Windows、macOS 和 Linux。Windows 使用 PowerShell + 当前用户 DPAPI；macOS/Linux 使用权限为 `0600` 的本地 Key 文件，并通过权限为 `0700` 的 shell helper 读取。WSL/Remote 扩展宿主应在实际运行 Codex 的同一环境中安装和运行扩展，详见[远程开发（Remote-SSH / WSL / 容器）](#远程开发remote-ssh--wsl--容器)。
 
 ## 系统要求与兼容性
 
@@ -98,10 +101,37 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 |---|---:|---:|---:|
 | Claude 官方/自定义 Provider 管理 | ✅ | ✅ | ✅ |
 | Claude 模型映射和配置检查 | ✅ | ✅ | ✅ |
+| Claude CLI（终端）同步 | ✅ | ✅ | ✅ |
+| Claude Desktop 独立管理 | ✅ | ⚠️ | ⚠️ |
 | Codex 官方服务 | ✅ | ✅ | ✅ |
-| Codex WebSocket 代理 | ✅ | ✅ | ✅ |
+| Codex WebSocket 代理 | ✅ | ✅ | ⚠️ |
 | Codex 自定义 Provider | ✅ | ✅ | ✅ |
 | 统一 Codex 会话历史 | ✅ | ✅ | ✅ |
+
+> ⚠️ Claude Desktop 三个平台都有官方版本（Linux 版见 <https://code.claude.com/docs/en/desktop-linux>），但目录布局在各平台的构建之间存在差异，目前只在 Windows 上实测通过。自动探测的路径为：Windows `%LOCALAPPDATA%\Claude` 与 `%APPDATA%\Claude`，macOS `~/Library/Application Support/Claude`，Linux `$XDG_CONFIG_HOME/Claude` 与 `~/.config/Claude`。若自动探测失败，可用 `aiProviderSwitcher.claudeDesktopConfigRoot` 手动指定目录。
+>
+> ⚠️ Codex 代理的**自动探测**在 Linux 上只认 GNOME（`gsettings org.gnome.system.proxy`）。KDE/Xfce 或无桌面环境下探测返回空，不会报错；此时可先导出 `HTTPS_PROXY` 环境变量，或直接手动填写代理地址——手动填写在所有平台上效果完全相同。
+
+### 远程开发（Remote-SSH / WSL / 容器）
+
+扩展声明为 `"extensionKind": ["workspace", "ui"]`，即在远程窗口中**默认运行在远程侧**。这是终端 CLI 场景下正确的选择：Claude Code 与 Codex 跑在远程主机上，`~/.claude`、`~/.codex` 也在远程主机上，配置必须写到那里。
+
+由此带来三点需要注意，扩展会在界面上主动提示：
+
+- **管理面板顶部会显示当前写入的是哪台机器**，例如“配置写入 WSL 子系统的 `~/.claude` 与 `~/.codex`”。
+- **Claude Desktop 无法从远程侧管理**。它是本地桌面应用，配置目录在你面前这台电脑上，远程主机没有该路径。在远程窗口中尝试切换 Desktop 时，扩展会说明原因并提供直达 `remote.extensionKind` 设置的入口。
+- **代理地址中的 `127.0.0.1` 在两侧指的是不同机器**。远程窗口下若探测到或填入回环地址，扩展会先弹窗确认再写入远程的 `~/.codex/.env`。WSL 场景还会额外提示：除非 `.wslconfig` 开启了 `networkingMode=mirrored`，子系统里的 `127.0.0.1` 并不是 Windows 主机，应改用 `/etc/resolv.conf` 中 `nameserver` 的地址或 `$(hostname).local`。
+
+如果你主要用这个扩展管理**本地** Claude Desktop，而不是远程的 CLI，可以在设置中把扩展固定到本地侧：
+
+```jsonc
+// settings.json
+"remote.extensionKind": {
+  "silver-zhang.ai-provider-switcher": ["ui"]
+}
+```
+
+改完需要重新加载窗口。固定为 `ui` 后，扩展写入的 `~/.claude`、`~/.codex` 也会变成本地路径。
 
 其他要求：
 
@@ -159,6 +189,22 @@ Windows PowerShell 如果阻止 `npm.ps1`，可改用 `npm.cmd install` 和 `npm
 4. 如有需要，在 Claude Code 中重新完成官方登录。
 
 切换到官方模式会清除扩展管理的 Claude Provider 环境变量，并将命令策略恢复为手动确认。
+
+### 终端 Claude CLI 与 Claude Desktop
+
+- **终端 CLI**：切换中转站/官方时，扩展会同步把 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN` 等写入 `~/.claude/settings.json` 的 `env` 块（保留你的其他 env 与全部其余设置；改前自动备份）。CLI 与 VS Code 内的 Claude Code 共享同一份会话历史，`claude --resume` 两边一致。
+- **Claude Desktop（独立）**：运行 **AI Provider Switcher: Switch Claude Desktop Service** 单独切换桌面应用，绝不改动 VS Code / CLI 配置。桌面应用不读取 `env`，它通过自己的「第三方推理」配置库路由：扩展会在数据目录下写入 `configLibrary/<id>.json`（网关地址与密钥）和 `configLibrary/_meta.json`（`appliedId` 指向当前生效的那一条），并把 `claude_desktop_config.json` 的 `deploymentMode` 切到 `3p`（切回官方则改为 `1p`）。原有的偏好设置、MCP 配置和未知字段都会保留，改动前自动备份。
+  - 数据目录会自动探测（Windows `%LOCALAPPDATA%\Claude` 与 `%APPDATA%\Claude`、macOS `~/Library/Application Support/Claude`、Linux `$XDG_CONFIG_HOME/Claude` 或 `~/.config/Claude`）。装在别处时，用切换面板里的**更改 Claude Desktop 数据目录…**选择，或直接设置 `aiProviderSwitcher.claudeDesktopConfigRoot`；未检测到时会列出已尝试的路径。
+  - 面板上显示的桌面状态直接读自磁盘，因此你在应用内或用其他工具改过的配置也会如实反映。
+  - 切换时会把该中转站已缓存的模型写进配置条目的 `inferenceModels`，桌面应用便不再自行探测模型列表。多数中转站不提供该探测接口（返回 404），这正是模型选择器为空、发消息报 `Your organization's model list hasn't loaded yet` 的原因；先**刷新模型列表**再切换即可。你为该中转站配置的模型映射会一并带过去（写成每个条目的 `anthropicFamilyTier`），桌面选择器里的 `opus`／`sonnet`／`haiku` 因此能落到真实模型上。
+  - ⚠️ **桌面应用只接受「读起来像 Anthropic 模型」的模型名**（含 `claude`/`opus`/`sonnet`/`haiku` 等），这是应用自身的限制：条目里只要有一个不合规的名字，整条配置都会被判为无效。因此 `deepseek-*`、`gpt-*`、`qwen-*` 这类**原名**无法直接写进桌面配置。
+  - **模型别名（让 DeepSeek 等接入桌面应用）**：这些服务商的 Anthropic 兼容端点自己就会把 Claude 模型名映射到它们的模型上，所以只要**发送 Claude 名**即可。切换时若发现没有可用模型名，会提供「使用标准 Claude 模型名」一键写入 `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`，也可手动填写；随时可用 **AI Provider Switcher: Configure Claude Desktop Models** 或 Claude 管理菜单修改，或恢复自动发现。别名会带上档位并标注来源网关（如 `Opus · deepseek`），避免误以为在用真 Claude。
+    - 以 DeepSeek 实测为例：`claude-opus-*` → `deepseek-v4-pro`，其余 `claude-*` → `deepseek-v4-flash`；裸名 `sonnet` 会被 DeepSeek 拒绝，所以别名要用带 `claude-` 前缀的完整名称。
+    - 别名是原样发给网关的，**是否生效取决于网关是否认识 Claude 名**。若网关只认自己的模型名，则该网关无法用于桌面应用。
+  - 切换后必须**完全退出并重启桌面应用**（含托盘图标）才生效。
+  - 删除某个 Claude 中转站时，它在桌面配置库中的条目会一并清除；如果它正是桌面应用当前使用的，会同时恢复官方订阅。
+  - ⚠️ 网关密钥会以明文写入该配置文件（这是桌面应用要求的格式），文件权限即为当前用户的数据目录权限。
+- 注意：会话历史不跨后端解密——在 A 中转站创建的对话，用 B 中转站继续可能失败（推理内容加密块只能由原后端解密）。
 
 ### 配置非 Claude 模型
 
@@ -219,6 +265,17 @@ Codex 按会话记录中的 `model_provider` 标签把历史分成互不可见�
 
 ## 解决 Codex 反复 Reconnecting
 
+### 为什么会有“代理”这个功能
+
+Codex 扩展并不是只发普通的 HTTPS 请求，它还要建立一条长连接（WebSocket）来流式接收回复。这两类连接读取代理配置的路径不一样：
+
+- 你在系统里设置的代理，往往只被 VS Code 的 HTTPS 请求层读到；
+- Codex 的后台进程是独立启动的 Node 进程，它只认自己进程环境里的 `HTTPS_PROXY` / `HTTP_PROXY`。
+
+结果就是一个很典型的现象：模型列表能刷出来、账号能登录（HTTPS 走通了），但一开始对话就反复 `Reconnecting`（WebSocket 直连被墙或被公司网络拦截）。
+
+这个功能做的事情很简单——把一个明确的代理地址写进 `~/.codex/.env`，让 Codex 后台进程启动时一定能读到，而不是指望它去继承某个不确定的系统设置。所谓“自动检测”只是替你把地址填好，**手动填写的效果完全一样**；探测不到并不代表功能不可用。
+
 部分代理环境能处理 HTTPS，但 Codex 的 WebSocket 连接没有正确使用代理，于是会多次 `Reconnecting` 后才回退。运行：
 
 **AI Provider Switcher: Configure Codex WebSocket Proxy**
@@ -245,7 +302,12 @@ Codex 按会话记录中的 `model_provider` 标签把历史分成互不可见�
 5. macOS `scutil --proxy`。
 6. GNOME Linux `gsettings`。
 
+第 1、2、3 步在所有系统上都有效；只有第 4、5、6 步依赖具体的操作系统机制。Linux 上第 6 步只覆盖 GNOME，KDE/Xfce 或纯命令行环境探测不到——这只影响“自动填好地址”这一步，不影响功能本身。
+
 如果自动检测失败，选择“设置或更新代理”，填写完整地址，例如 `http://127.0.0.1:7890`。必须使用 HTTP(S) 地址；当前不接受 `socks5://`。
+
+> [!NOTE]
+> 在 Remote-SSH / WSL / 容器窗口中，`127.0.0.1` 指的是**远程主机自己**，不是你面前这台电脑。扩展会在写入前弹窗确认，详见[远程开发](#远程开发remote-ssh--wsl--容器)。
 
 ### 官方服务还是所有 Provider？
 
@@ -325,13 +387,18 @@ NO_PROXY="localhost,127.0.0.1,::1"
 - `AI Provider Switcher: Quick Switch Provider`
 - `AI Provider Switcher: Open Provider Manager`
 - `AI Provider Switcher: Use Claude Official Subscription`
+- `AI Provider Switcher: Switch Claude Desktop Service`
 - `AI Provider Switcher: Manage Claude Gateways`
+- `AI Provider Switcher: Edit Claude Gateway`
 - `AI Provider Switcher: Configure Claude Model Mapping`
 - `AI Provider Switcher: Configure Claude Command Strategy`
+- `AI Provider Switcher: Configure Claude Desktop Models`
 - `AI Provider Switcher: Inspect Other Claude Configuration`
 - `AI Provider Switcher: Switch Codex Provider`
 - `AI Provider Switcher: Use Codex Official Provider`
 - `AI Provider Switcher: Manage Codex Providers`
+- `AI Provider Switcher: Edit Codex Provider`
+- `AI Provider Switcher: Unified Codex Session History`
 - `AI Provider Switcher: Refresh Codex Models`
 - `AI Provider Switcher: Configure Codex WebSocket Proxy`
 
@@ -358,6 +425,9 @@ AI Provider Switcher brings those tasks into one visual workflow:
 - Save named providers instead of repeatedly editing configuration files.
 - Map non-Claude model IDs to every Claude model family and agent role.
 - Synchronize custom Codex models into Codex's native model control.
+- Keep the standalone terminal Claude CLI in step with the VS Code integration.
+- Manage Claude Desktop independently through its third-party inference config library.
+- Unify Codex session history so official and third-party conversations share one list.
 - Detect external Claude settings that override the selected provider.
 - Configure a safe, reversible Codex WebSocket/HTTPS proxy.
 - Preserve local session history when switching providers.
@@ -382,6 +452,8 @@ AI Provider Switcher brings those tasks into one visual workflow:
 - Store a command strategy per provider: Auto, Accept Edits, Manual, or `bypassPermissions` with a high-risk confirmation.
 - Inspect inherited environment variables and Claude user/project settings for routing, authentication, model, and permission conflicts.
 - Back up supported files before removing only conflicting provider fields.
+- Sync the same managed environment into `~/.claude/settings.json` so the terminal `claude` CLI follows the VS Code integration.
+- Manage Claude Desktop independently: named entries in the app's third-party inference config library, cached model lists and Anthropic-style model aliases, install-directory discovery, desktop state read back from disk, and cleanup when a gateway is deleted.
 
 ### Codex
 
@@ -390,6 +462,7 @@ AI Provider Switcher brings those tasks into one visual workflow:
 - Remove only extension-managed provider blocks and restore the recorded top-level selection when returning to the official provider.
 - Keep API keys out of plaintext `config.toml`.
 - Configure a Codex WebSocket/HTTPS proxy with environment, VS Code, Windows, macOS, and GNOME Linux detection; per-device ports; manual HTTP(S) input; provider scope; conflict inspection; and reversible writes.
+- Unify Codex session history: run the official subscription under the shared `custom` provider id and optionally migrate existing sessions into the shared list, with automatic backups and a ledger-based restore.
 
 ### Usage and quota MVP
 
@@ -411,9 +484,16 @@ Run **AI Provider Switcher: Configure Provider Usage API**, then **AI Provider S
 |---|---:|---:|---:|
 | Claude official/custom provider management | ✅ | ✅ | ✅ |
 | Claude model mapping and conflict inspection | ✅ | ✅ | ✅ |
+| Terminal Claude CLI sync | ✅ | ✅ | ✅ |
+| Claude Desktop management | ✅ | ⚠️ | ⚠️ |
 | Official Codex provider | ✅ | ✅ | ✅ |
-| Codex WebSocket proxy | ✅ | ✅ | ✅ |
+| Codex WebSocket proxy | ✅ | ✅ | ⚠️ |
 | Custom Codex providers | ✅ | ✅ | ✅ |
+| Unified Codex session history | ✅ | ✅ | ✅ |
+
+> ⚠️ Claude Desktop has official builds on all three platforms (Linux: <https://code.claude.com/docs/en/desktop-linux>), but the data-directory layout differs between platform builds and has so far only been verified on Windows. Auto-detection probes: Windows `%LOCALAPPDATA%\Claude` and `%APPDATA%\Claude`, macOS `~/Library/Application Support/Claude`, Linux `$XDG_CONFIG_HOME/Claude` and `~/.config/Claude`. If detection fails, set `aiProviderSwitcher.claudeDesktopConfigRoot` manually.
+>
+> ⚠️ Codex proxy **auto-detection** on Linux only understands GNOME (`gsettings org.gnome.system.proxy`). KDE/Xfce or headless setups simply detect nothing and do not error; export `HTTPS_PROXY` first, or enter the address manually — manual entry behaves identically on every platform.
 
 Requirements:
 
@@ -422,6 +502,25 @@ Requirements:
 - Install and enable the official OpenAI Codex IDE extension to use Codex features.
 - A custom Claude provider must expose a compatible Anthropic API.
 - A custom Codex provider must implement the OpenAI Responses API. Chat Completions-only gateways are not supported.
+
+### Remote development (Remote-SSH / WSL / containers)
+
+The extension declares `"extensionKind": ["workspace", "ui"]`, so in a remote window it runs **on the remote side by default**. That is the right place for terminal CLIs: Claude Code and Codex run on the remote host, and so do `~/.claude` and `~/.codex`. Three consequences follow, each surfaced in the UI:
+
+- **The manager states which machine is being written to**, e.g. “config is written to the WSL subsystem's `~/.claude` and `~/.codex`”.
+- **Claude Desktop cannot be managed from the remote side.** It is a local GUI application whose data directory lives on the machine you are looking at, which the remote host has no path to. Attempting a Desktop switch in a remote window explains this and links straight to the `remote.extensionKind` setting.
+- **`127.0.0.1` in a proxy address means different machines on the two sides.** A loopback address — detected or typed — is confirmed before being written into the remote `~/.codex/.env`. Under WSL the message names the fix: the subsystem's `127.0.0.1` is not the Windows host unless `.wslconfig` enables `networkingMode=mirrored`, so use the `nameserver` address from `/etc/resolv.conf` or `$(hostname).local` for a Windows-side proxy.
+
+To manage **local** Claude Desktop instead of a remote CLI, pin the extension to the local side:
+
+```jsonc
+// settings.json
+"remote.extensionKind": {
+  "silver-zhang.ai-provider-switcher": ["ui"]
+}
+```
+
+Reload after changing it. With `"ui"`, the `~/.claude` and `~/.codex` directories the extension writes become the local ones too.
 
 ## Installation
 
@@ -466,6 +565,22 @@ Open the manager by either:
 
 Run **AI Provider Switcher: Use Claude Official Subscription**, review external conflicts, and reload VS Code. Managed provider environment entries are removed and the command strategy is returned to Manual.
 
+### Terminal Claude CLI and Claude Desktop
+
+- **Terminal CLI**: switching a gateway (or back to official) writes the same managed `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` block into `~/.claude/settings.json`'s `env` — your other env entries and every other setting are preserved, with a timestamped backup before each change. The CLI shares the same session history as the VS Code integration, so `claude --resume` agrees on both sides.
+- **Claude Desktop (independent)**: run **AI Provider Switcher: Switch Claude Desktop Service** to switch the desktop app alone; VS Code and CLI configuration are never touched. The desktop app does not read `env` — it routes through its own third-party inference mechanism, so the extension writes `configLibrary/<id>.json` (gateway URL and key) and `configLibrary/_meta.json` (`appliedId` selects the live entry) under the app data directory, and switches `claude_desktop_config.json`'s `deploymentMode` to `3p` (back to `1p` for official). Existing preferences, MCP configuration, and unknown fields are preserved; changes are backed up first.
+  - The data directory is auto-detected (Windows `%LOCALAPPDATA%\Claude` and `%APPDATA%\Claude`, macOS `~/Library/Application Support/Claude`, Linux `$XDG_CONFIG_HOME/Claude` or `~/.config/Claude`). For installs elsewhere use the **Change Claude Desktop data directory…** picker or set `aiProviderSwitcher.claudeDesktopConfigRoot`; a failed detection lists the paths that were tried.
+  - The manager chip and switch dialog read the desktop state back from disk, so changes made inside the app or by another tool show up truthfully.
+  - Switching writes the gateway's cached models into the entry's `inferenceModels`, so the desktop app stops running its own model discovery — the request most relays answer with 404, which is what leaves the model picker empty and every message failing with `Your organization's model list hasn't loaded yet`. **Refresh the model list first**, then switch. A configured model mapping is carried across as each entry's `anthropicFamilyTier`, which is what makes the `opus` / `sonnet` / `haiku` names in the desktop picker resolve to real models.
+  - ⚠️ **The desktop app only accepts model names that read like Anthropic models** (containing `claude` / `opus` / `sonnet` / `haiku`, etc.). This is the app's own restriction: one non-compliant name invalidates the whole entry, so `deepseek-*`, `gpt-*`, `qwen-*` **original names** cannot be written directly.
+  - **Model aliases (how DeepSeek and friends reach the desktop app)**: these providers' Anthropic-compatible endpoints map Claude names onto their own models server-side, so sending Claude names is all it takes. When a switch finds no usable model, a one-click **Use standard Claude model names** set writes `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`; hand-written aliases are also accepted and **AI Provider Switcher: Configure Claude Desktop Models** (or the Claude management menu) edits them any time. Aliases carry their tier and are labelled with the gateway they resolve to (e.g. `Opus · deepseek`), so the picker never pretends to offer genuine Claude models.
+    - DeepSeek, measured: `claude-opus-*` → `deepseek-v4-pro`, every other `claude-*` → `deepseek-v4-flash`; the bare `sonnet` name is rejected, so aliases use full `claude-`-prefixed names.
+    - Aliases are sent verbatim to the gateway — **whether they work depends on the gateway recognising Claude names**. A gateway that only accepts its own model IDs cannot be used with the desktop app.
+  - Fully quit and restart the desktop app (including the tray icon) after switching.
+  - Deleting a Claude gateway also unlinks its desktop config entry and, when it was the live one, restores the official subscription.
+  - ⚠️ The gateway key is written in plain text into that configuration file (the format the desktop app requires); file protection is whatever the user data directory provides.
+- Note: session history does not decrypt across backends — continuing a conversation created on gateway A with gateway B may fail (the encrypted reasoning block can only be decrypted by the backend that produced it).
+
 ### Map non-Claude models
 
 Run **AI Provider Switcher: Configure Claude Model Mapping**. Recommended mode uses one main model and one fast/low-cost model; advanced mode configures each family separately. Enable the 1M marker only when the provider explicitly supports it.
@@ -487,6 +602,24 @@ Run **AI Provider Switcher: Inspect Other Claude Configuration**. The extension 
 7. Start a new conversation after switching.
 
 Enter a root such as `https://api.example.com`; `/v1` is derived automatically.
+
+### Unified Codex session history (official and third-party in one list)
+
+Codex buckets its history by the `model_provider` tag each session records: the official subscription lands in the built-in `openai` bucket while each managed gateway has its own id, so after frequent switches old sessions can look “gone”. **AI Provider Switcher: Unified Codex Session History** (or the Codex card's *Unified history* button) removes that split:
+
+- **When enabled**, the official subscription runs under the shared `custom` provider id (authentication still goes through the ChatGPT login in `auth.json`; `base_url` falls back to the official backend — only the classification tag changes), so official and third-party sessions appear in one history list.
+- The enable dialog offers **“Enable and migrate existing official sessions”** (recommended; backed up first) or **“Enable only (no migration)”** (affects only sessions created afterwards).
+- **When disabled**, migration backups make **“Disable and restore migrated sessions”** available: a ledger-based restore flips back only sessions that are both in the ledger and still tagged `custom`. Sessions created while unified was on cannot be attributed, so they stay in the shared list (visible again when re-enabled).
+
+Safety:
+
+- Migration/restore rewrites **only** `session_meta.model_provider` (`~/.codex/sessions`, `archived_sessions` `.jsonl` files) and `threads.model_provider` (`state_5.sqlite` / `state.db`) — never conversation content.
+- Full-file backups under `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/<timestamp>/` (`jsonl/`, `state/`, `meta.json`) before every rewrite; restores back up first to `codex-official-history-unify-restore-v1/`.
+- Atomic writes, file-unchanged verification, per-item fault isolation, and a bounded startup retry. A database in WAL mode is snapshotted safely.
+- Refusal gates: unified routing is not injected when `config.toml` already carries an explicit `model_provider` or a manually defined `[model_providers.custom]` section.
+
+> [!WARNING]
+> Resuming an old session on a different provider may fail because the other backend cannot decrypt the session's `encrypted_content` reasoning — an upstream Codex design. Unification solves list visibility, not cross-provider continuation; resume old sessions on their original provider.
 
 ### Return to official Codex
 
@@ -534,11 +667,14 @@ The extension owns only a marked block in `~/.codex/.env`. It checks existing un
 | Claude provider metadata and model cache | Global VS Code settings |
 | Claude token | VS Code Secret Storage and, while active, `claudeCode.environmentVariables` for the Claude Code extension |
 | Claude permission mode | Global VS Code settings and `~/.claude/settings.json` |
+| Terminal CLI environment | A managed `env` block in `~/.claude/settings.json` |
+| Claude Desktop configuration | Entries under the app data directory's `configLibrary/` with `appliedId` in `_meta.json`; `deploymentMode` in `claude_desktop_config.json` |
 | Codex provider metadata and model cache | Global VS Code settings |
 | Codex API key | VS Code Secret Storage; additionally a current-user DPAPI file on Windows or a mode-`0600` local key file on macOS/Linux; never written to `config.toml` |
 | Codex provider configuration | Top-level selection and marked blocks in `~/.codex/config.toml` |
 | Codex model catalog | `~/.codex/ai-provider-switcher-models.json` |
 | Codex proxy | A marked block in `~/.codex/.env` |
+| Unified history backups | `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/` (migration) and `codex-official-history-unify-restore-v1/` (restore) |
 | Provider usage snapshots | Global VS Code settings; only balance, percentages, rate-limit values, and timestamps are cached, not raw API bodies |
 
 Security guidance:
@@ -571,6 +707,10 @@ Verify that the proxy process is running, its port is listening, it supports HTT
 
 No. Local session history is preserved, but an active conversation is not migrated across providers. Start a new conversation after switching.
 
+### Why does resuming an old session fail under unified Codex history?
+
+The session file is intact. The cause is upstream design: the `encrypted_content` reasoning ciphertext can only be decrypted by the backend that produced it, so another provider cannot continue it. Resume on the original provider, or start a new session.
+
 ## Commands
 
 Search `AI Provider Switcher` in the Command Palette. Common commands include:
@@ -578,13 +718,18 @@ Search `AI Provider Switcher` in the Command Palette. Common commands include:
 - `AI Provider Switcher: Quick Switch Provider`
 - `AI Provider Switcher: Open Provider Manager`
 - `AI Provider Switcher: Use Claude Official Subscription`
+- `AI Provider Switcher: Switch Claude Desktop Service`
 - `AI Provider Switcher: Manage Claude Gateways`
+- `AI Provider Switcher: Edit Claude Gateway`
 - `AI Provider Switcher: Configure Claude Model Mapping`
 - `AI Provider Switcher: Configure Claude Command Strategy`
+- `AI Provider Switcher: Configure Claude Desktop Models`
 - `AI Provider Switcher: Inspect Other Claude Configuration`
 - `AI Provider Switcher: Switch Codex Provider`
 - `AI Provider Switcher: Use Codex Official Provider`
 - `AI Provider Switcher: Manage Codex Providers`
+- `AI Provider Switcher: Edit Codex Provider`
+- `AI Provider Switcher: Unified Codex Session History`
 - `AI Provider Switcher: Refresh Codex Models`
 - `AI Provider Switcher: Configure Codex WebSocket Proxy`
 

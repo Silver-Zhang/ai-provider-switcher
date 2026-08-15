@@ -50,6 +50,8 @@ Module._load = load;
 const STATE = {
   claudeMode: "中转 A",
   claudeOfficial: false,
+  claudeDesktopMode: "官方服务",
+  claudeDesktopOfficial: true,
   claudeProviders: [
     {
       id: "relay-a",

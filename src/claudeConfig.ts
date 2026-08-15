@@ -444,3 +444,74 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
+
+export type ClaudeJsonEnvUpdate = { content: string; changed: boolean };
+
+function parseClaudeJsonDocument(content: string, label: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error(`${label} 不是有效的 JSON，无法安全写入。`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`${label} 的根节点不是对象，无法安全写入。`);
+  }
+  return parsed;
+}
+
+/**
+ * Merges the plugin-managed env keys into a Claude JSON config document
+ * (user settings.json or claude_desktop_config.json). Unrelated `env` entries
+ * and every other top-level key are preserved; managed keys that are absent
+ * from `envVars` are removed, and an emptied `env` object is dropped entirely.
+ */
+export function mergeClaudeJsonEnv(
+  content: string,
+  managedKeys: ReadonlySet<string>,
+  envVars: ClaudeEnvVar[],
+  label = "Claude 配置文件"
+): ClaudeJsonEnvUpdate {
+  const settings = parseClaudeJsonDocument(content, label);
+  const hadEnv = isRecord(settings.env);
+  const env: Record<string, unknown> = hadEnv ? { ...(settings.env as Record<string, unknown>) } : {};
+  let changed = false;
+
+  const wanted = new Map<string, string>();
+  for (const entry of envVars) {
+    const name = entry.name.trim();
+    if (!name) continue;
+    wanted.set(name, entry.value);
+  }
+  for (const [name, value] of wanted) {
+    if (env[name] !== value) {
+      env[name] = value;
+      changed = true;
+    }
+  }
+  for (const key of Object.keys(env)) {
+    if (managedKeys.has(key) && !wanted.has(key)) {
+      delete env[key];
+      changed = true;
+    }
+  }
+
+  if (Object.keys(env).length === 0) {
+    if (hadEnv) {
+      delete settings.env;
+      changed = true;
+    }
+  } else {
+    settings.env = env;
+  }
+  return { content: `${JSON.stringify(settings, null, 2)}\n`, changed };
+}
+
+/** Removes only the plugin-managed env keys from a Claude JSON config document. */
+export function clearClaudeManagedJsonEnv(
+  content: string,
+  managedKeys: ReadonlySet<string>,
+  label = "Claude 配置文件"
+): ClaudeJsonEnvUpdate {
+  return mergeClaudeJsonEnv(content, managedKeys, [], label);
+}

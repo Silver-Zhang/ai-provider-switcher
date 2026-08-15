@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -40,9 +40,14 @@
     "onCommand:aiProviderSwitcher.switchMode",
     "onCommand:aiProviderSwitcher.useOfficial",
     "onCommand:aiProviderSwitcher.useGateway",
+    "onCommand:aiProviderSwitcher.switchClaudeDesktop",
     "onCommand:aiProviderSwitcher.unifyCodexHistory"
   ],
   "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
   "contributes": {
     "commands": [
       {
@@ -60,6 +65,10 @@
       {
         "command": "aiProviderSwitcher.useGateway",
         "title": "AI Provider Switcher: Use Claude Gateway"
+      },
+      {
+        "command": "aiProviderSwitcher.switchClaudeDesktop",
+        "title": "AI Provider Switcher: Switch Claude Desktop Service"
       },
       {
         "command": "aiProviderSwitcher.manageGateways",
@@ -100,6 +109,10 @@
       {
         "command": "aiProviderSwitcher.configureClaudePermissions",
         "title": "AI Provider Switcher: Configure Claude Command Strategy"
+      },
+      {
+        "command": "aiProviderSwitcher.configureClaudeDesktopModels",
+        "title": "AI Provider Switcher: Configure Claude Desktop Models"
       },
       {
         "command": "aiProviderSwitcher.inspectClaudeConfiguration",
@@ -200,6 +213,13 @@
               "baseUrl": {
                 "type": "string"
               },
+              "desktopModels": {
+                "type": "array",
+                "description": "Optional Anthropic-style model IDs to offer Claude Desktop for this gateway, used instead of its discovered model names. Claude Desktop refuses IDs that do not read as Anthropic routes (deepseek-*, gpt-*, qwen-*), so a gateway serving its own names can only be reached by sending Claude names it maps itself. The IDs are sent upstream verbatim.",
+                "items": {
+                  "type": "string"
+                }
+              },
               "modelMapping": {
                 "type": "object",
                 "description": "Optional mapping from Claude model families and agents to model IDs accepted by this Anthropic-compatible provider.",
@@ -295,6 +315,11 @@
           "type": "string",
           "default": "",
           "description": "Currently selected Claude custom provider ID."
+        },
+        "aiProviderSwitcher.claudeDesktopConfigRoot": {
+          "type": "string",
+          "default": "",
+          "description": "Claude Desktop data directory (the folder containing claude_desktop_config.json), e.g. %LOCALAPPDATA%\\Claude on Windows or ~/Library/Application Support/Claude on macOS. Leave empty to auto-detect; set it when the app is installed somewhere non-standard. The desktop app is managed independently through its third-party inference config library and only picks up changes after a full restart."
         },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",
