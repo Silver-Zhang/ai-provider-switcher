@@ -1,6 +1,14 @@
 # Changelog
 
 All notable changes to AI Provider Switcher are documented in this file.
+## 0.5.1 - 2026-08-16
+
+- Added a per-provider "Models & parameters" editor in the visual manager: the selected service's model list is editable row by row (add, rename, remove), each model can be assigned a mapping role (main / opus / sonnet / haiku / fable / subagent), and the gateway-wide effort level and the Claude Desktop model aliases are set from the same form. Replaces the long multi-step mapping wizard for day-to-day edits; the wizard remains available in the overflow menu.
+- Changed the 1M-context declaration from a gateway-wide lock to per-model switches: every mapping role (main / opus / sonnet / haiku / fable / subagent) can declare 1M on its own, driving the CLI's `[1m]` suffix per role, and every Claude Desktop alias carries its own switch, so a gateway whose models have different context windows no longer forces one answer on all of them. The default alias inherits the main model's declaration, and stored legacy `supports1m` mappings keep their old behavior.
+- Fixed the Claude Desktop model picker never offering the 1M-context option for a gateway reached through Anthropic-style aliases (such as DeepSeek). The `supports1m` capability declared in a provider's model mapping is now carried onto the alias entries, where the desktop app reads it — every alias gets the 1M variant (the opus alias resolves to the gateway's pro model, which deserves it as much as the default), and `prefer1m` starts the picker on the default entry's 1M variant. Requires re-applying the desktop switch (and a full app restart, tray icon included) after updating.
+- Changed the standard Claude Desktop alias set to the current Claude generations (`claude-sonnet-5`, `claude-opus-5`, `claude-haiku-5`) instead of the dated 4-5 names. Anthropic-compatible gateways route by prefix (`claude-opus-*` to the pro model, other `claude-*` names to the fast one), so existing deployments keep working; re-apply the desktop switch to pick the names up.
+- Fixed the first-ever desktop switch writing an empty model list: when the switch found no usable model and the confirmation attached the standard Claude aliases, the config entry was still written with the empty list computed before the prompt, leaving the desktop picker empty. The entry is now rebuilt after the confirmation, so a brand-new machine reaches a working desktop config in one switch.
+
 ## 0.5.0 - 2026-08-15
 
 - Added Claude CLI support: switching a gateway (or back to the official subscription) now also writes the managed env block into `~/.claude/settings.json`, so the standalone terminal `claude` CLI shares the same provider as the VS Code integration. Unrelated `env` entries and every other settings key are preserved, with a timestamped backup and atomic write before every change.

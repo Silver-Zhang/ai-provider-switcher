@@ -43,7 +43,7 @@
 		{
 			"label": "ai-provider-switcher: package and install",
 			"type": "shell",
-			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.0.vsix --force",
+			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.1.vsix --force",
 			"options": {
 				"shell": {
 					"executable": "C:\\WINDOWS\\System32\\cmd.exe",

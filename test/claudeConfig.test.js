@@ -181,6 +181,24 @@ test("only adds the 1m suffix when the provider mapping declares support", () =>
   assert.equal(longContext.find((entry) => entry.name === "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.value, "fast-model");
 });
 
+test("each role can declare 1M on its own", () => {
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: "pro",
+    haikuModel: "fast",
+    longContextRoles: ["haiku", "subagent"]
+  });
+  const environment = createClaudeModelEnvironment(mapping);
+  assert.equal(environment.find((entry) => entry.name === "ANTHROPIC_MODEL")?.value, "pro");
+  assert.equal(environment.find((entry) => entry.name === "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.value, "fast[1m]");
+  assert.equal(environment.find((entry) => entry.name === "CLAUDE_CODE_SUBAGENT_MODEL")?.value, "fast[1m]");
+  assert.equal(environment.find((entry) => entry.name === "ANTHROPIC_DEFAULT_OPUS_MODEL")?.value, "pro");
+});
+
+test("stored legacy supports1m maps onto the roles the old code suffixed", () => {
+  const mapping = normalizeClaudeModelMapping({ mainModel: "m", haikuModel: "h", supports1m: true });
+  assert.deepEqual(mapping.longContextRoles, ["main", "fable", "opus", "sonnet"]);
+});
+
 test("normalizes stored model mappings and the DeepSeek official template", () => {
   const normalized = normalizeClaudeModelMapping({ mainModel: "ds-main", haikuModel: "ds-fast" });
   assert.equal(normalized?.opusModel, "ds-main");

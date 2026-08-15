@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -36,12 +36,7 @@
   },
   "pricing": "Free",
   "activationEvents": [
-    "onStartupFinished",
-    "onCommand:aiProviderSwitcher.switchMode",
-    "onCommand:aiProviderSwitcher.useOfficial",
-    "onCommand:aiProviderSwitcher.useGateway",
-    "onCommand:aiProviderSwitcher.switchClaudeDesktop",
-    "onCommand:aiProviderSwitcher.unifyCodexHistory"
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "extensionKind": [

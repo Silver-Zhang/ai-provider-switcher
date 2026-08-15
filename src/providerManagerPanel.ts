@@ -33,15 +33,28 @@ export type ProviderManagerAction =
   | "removeProvider"
   | "reorderProviders"
   | "backToOverview"
+  | "editProviderModels"
+  | "cancelProviderModelEdit"
+  | "saveProviderModels"
   | "openCodex";
 
 export type ProviderManagerDraft = { name: string; baseUrl: string; secret?: string };
+
+/** One row of the per-provider model editor: the model ID, its mapping role, and its 1M flag. */
+export type ProviderModelRow = { name: string; role: string; supports1m: boolean };
+
+export type ProviderModelFormPayload = {
+  models: ProviderModelRow[];
+  effort: string;
+  desktopModels: Array<{ name: string; supports1m: boolean }>;
+};
 
 export type ProviderManagerMessage = {
   action?: ProviderManagerAction;
   providerKind?: "claude" | "codex";
   providerId?: string;
   draft?: ProviderManagerDraft;
+  modelForm?: ProviderModelFormPayload;
   /** Provider IDs in the order the list was dragged into. */
   order?: string[];
 };
@@ -74,6 +87,10 @@ export type ProviderManagerState = {
     usageEndpoint?: string;
     usageMappings?: string;
     usage: string;
+    /** Model editor rows: cached model IDs plus the mapping role each one plays. */
+    modelList: ProviderModelRow[];
+    effortLevel: string;
+    desktopModels: Array<{ name: string; supports1m: boolean }>;
   }>;
   codexMode: string;
   codexOfficial: boolean;
@@ -124,8 +141,10 @@ export class ProviderManagerPanel {
 
   private selectedProvider: { kind: "claude" | "codex"; id: string } | undefined;
   private editing = false;
+  private editingModels = false;
   /** Survives a rejected save so the form can be re-rendered with what was typed. */
   private pendingDraft: { name: string; baseUrl: string } | undefined;
+  private pendingModelForm: ProviderModelFormPayload | undefined;
   private notice: string | undefined;
 
   private constructor(
@@ -164,10 +183,21 @@ export class ProviderManagerPanel {
         this.render();
         return;
       }
+      if (message.action === "editProviderModels" || message.action === "cancelProviderModelEdit") {
+        if (message.action === "editProviderModels") this.select(message);
+        this.leaveEditing();
+        this.editingModels = message.action === "editProviderModels";
+        this.render();
+        return;
+      }
       const result = await this.onAction(message);
       if (message.action === "saveProviderEdit") {
         this.editing = result?.keepEditing === true;
         this.retainDraft(this.editing ? message.draft : undefined, result?.message);
+      } else if (message.action === "saveProviderModels") {
+        this.editingModels = result?.keepEditing === true;
+        this.pendingModelForm = this.editingModels ? message.modelForm : undefined;
+        this.notice = result?.message;
       } else {
         this.notice = undefined;
       }
@@ -184,7 +214,9 @@ export class ProviderManagerPanel {
 
   private leaveEditing(): void {
     this.editing = false;
+    this.editingModels = false;
     this.pendingDraft = undefined;
+    this.pendingModelForm = undefined;
     this.notice = undefined;
   }
 
@@ -233,7 +265,14 @@ export class ProviderManagerPanel {
       status: `${statusChip("Claude", state.claudeMode, state.claudeOfficial)}${statusChip("Claude Desktop", state.claudeDesktopMode, state.claudeDesktopOfficial)}${statusChip("Codex", state.codexMode, state.codexOfficial)}`,
       list: providerList(state, this.selectedProvider),
       detail: selected
-        ? providerDetail(selected.kind, selected.provider, this.editing ? { draft: this.pendingDraft, notice: this.notice } : undefined)
+        ? providerDetail(
+            selected.kind,
+            selected.provider,
+            this.editing ? { draft: this.pendingDraft, notice: this.notice } : undefined,
+            this.editingModels && selected.kind === "claude"
+              ? { draft: this.pendingModelForm, notice: this.notice }
+              : undefined
+          )
         : overviewPane(state)
     });
   }
@@ -354,9 +393,20 @@ export class ProviderManagerPanel {
     .field-hint { display: block; margin-top: 6px; color: var(--vscode-descriptionForeground); font-size: 11px; overflow-wrap: anywhere; }
     .locked { display: block; color: var(--vscode-descriptionForeground); font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; overflow-wrap: anywhere; }
 
+    .model-form input[type="text"], .model-form select { width: 100%; padding: 7px 10px; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 7px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); font: inherit; font-size: 12px; }
+    .model-form input[type="text"]:focus-visible, .model-form select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+    .model-rows, .desktop-model-rows { display: grid; gap: 8px; margin-top: 12px; }
+    .model-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px 54px 28px; gap: 8px; align-items: center; }
+    .model-1m { justify-self: start; }
+    .desktop-model-row { display: grid; grid-template-columns: minmax(0, 1fr) 54px 28px; gap: 8px; align-items: center; }
+    .model-section { align-items: start; }
+    .check-row { display: flex; gap: 6px; align-items: center; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.5; }
+    .check-row input { margin: 0; }
+    .model-form > button { margin-top: 8px; }
+
     @media (max-width: 900px) { .workspace { grid-template-columns: minmax(0, 1fr); } .list-pane { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     @media (max-width: 720px) { .shell { padding: 14px 13px 26px; } .list-pane { grid-template-columns: minmax(0, 1fr); } .detail-section { display: block; } .detail-section .actions { margin-top: 13px; } .toolbar { display: block; } .toolbar .actions { margin-top: 12px; } }
-    @media (max-width: 440px) { .detail-grid { grid-template-columns: minmax(0, 1fr); } .detail-wide { grid-column: auto; } }
+    @media (max-width: 440px) { .detail-grid { grid-template-columns: minmax(0, 1fr); } .detail-wide { grid-column: auto; } .model-row { grid-template-columns: minmax(0, 1fr) 28px; } .model-row .model-role, .model-row .model-1m { grid-column: 1; } .model-row .model-remove { grid-column: 2; grid-row: 1; } .desktop-model-row { grid-template-columns: minmax(0, 1fr) 54px 28px; } }
   </style>
 </head>
 <body>
@@ -388,11 +438,34 @@ export class ProviderManagerPanel {
     const vscode = acquireVsCodeApi();
     const fieldValue = (id) => { const field = document.getElementById(id); return field ? field.value : ''; };
     const readDraft = () => ({ name: fieldValue('edit-name'), baseUrl: fieldValue('edit-base-url'), secret: fieldValue('edit-secret') });
+    const readModelForm = () => ({
+      models: Array.from(document.querySelectorAll('.model-row')).map((row) => ({
+        name: row.querySelector('.model-name').value.trim(),
+        role: row.querySelector('.model-role').value,
+        supports1m: Boolean(row.querySelector('.model-1m input')?.checked)
+      })),
+      effort: fieldValue('model-effort'),
+      desktopModels: Array.from(document.querySelectorAll('.desktop-model-row')).map((row) => ({
+        name: row.querySelector('.desktop-model-name').value.trim(),
+        supports1m: Boolean(row.querySelector('.desktop-model-1m')?.checked)
+      }))
+    });
+    const addModelRow = () => {
+      const template = document.getElementById('model-row-template');
+      const container = document.getElementById('model-rows');
+      if (template && container) container.appendChild(template.content.cloneNode(true));
+    };
+    const addDesktopModelRow = () => {
+      const template = document.getElementById('desktop-model-row-template');
+      const container = document.getElementById('desktop-model-rows');
+      if (template && container) container.appendChild(template.content.cloneNode(true));
+    };
     const send = (element) => vscode.postMessage({
       action: element.dataset.action,
       providerKind: element.dataset.providerKind,
       providerId: element.dataset.providerId,
-      draft: element.dataset.action === 'saveProviderEdit' ? readDraft() : undefined
+      draft: element.dataset.action === 'saveProviderEdit' ? readDraft() : undefined,
+      modelForm: element.dataset.action === 'saveProviderModels' ? readModelForm() : undefined
     });
     const asElement = (node) => node instanceof Element ? node : null;
     const closest = (event, selector) => { const node = asElement(event.target); return node ? node.closest(selector) : null; };
@@ -402,6 +475,10 @@ export class ProviderManagerPanel {
     document.addEventListener('click', (event) => {
       const menu = closest(event, 'details.overflow');
       document.querySelectorAll('details.overflow[open]').forEach((open) => { if (open !== menu) open.open = false; });
+      if (closest(event, '[data-model-add]')) { addModelRow(); return; }
+      if (closest(event, '[data-desktop-add]')) { addDesktopModelRow(); return; }
+      const remove = closest(event, '.model-remove, .desktop-model-remove');
+      if (remove) { remove.closest('.model-row, .desktop-model-row')?.remove(); return; }
       const target = closest(event, '[data-action]');
       if (target) send(target);
     });
@@ -409,8 +486,8 @@ export class ProviderManagerPanel {
       if (event.key === 'Escape') document.querySelectorAll('details.overflow[open]').forEach((open) => { open.open = false; });
       if (event.key !== 'Enter') return;
       const input = asElement(event.target);
-      if (!input || !input.closest('.edit-form')) return;
-      const save = document.querySelector('[data-action="saveProviderEdit"]');
+      if (!input || !input.closest('.edit-form, .model-form')) return;
+      const save = document.querySelector('[data-action="saveProviderEdit"], [data-action="saveProviderModels"]');
       if (save) { event.preventDefault(); send(save); }
     });
 
@@ -634,10 +711,12 @@ function providerEditForm(
 function providerDetail(
   kind: "claude" | "codex",
   provider: ProviderView,
-  edit?: { draft?: { name: string; baseUrl: string }; notice?: string }
+  edit?: { draft?: { name: string; baseUrl: string }; notice?: string },
+  modelEdit?: { draft?: ProviderModelFormPayload; notice?: string }
 ): string {
   const isClaude = kind === "claude";
   if (edit) return providerEditForm(kind, provider, edit);
+  if (modelEdit && isClaude) return providerModelForm(provider as ProviderManagerState["claudeProviders"][number], modelEdit);
   const claudeProvider = isClaude ? provider as ProviderManagerState["claudeProviders"][number] : undefined;
   const codexProvider = !isClaude ? provider as ProviderManagerState["codexProviders"][number] : undefined;
   const target: ActionTarget = { kind, id: provider.id };
@@ -645,7 +724,7 @@ function providerDetail(
     ? [
         { label: provider.active ? "重新应用此服务" : "切换到此服务", action: "switchClaude", primary: true },
         { label: "编辑配置", action: "editProvider" },
-        { label: "模型映射", action: "mapClaudeModels" },
+        { label: "模型与参数", action: "editProviderModels" },
         { label: "命令策略", action: "configureClaudePermissions" }
       ]
     : [
@@ -654,7 +733,7 @@ function providerDetail(
         { label: "选择默认模型", action: "configureCodexModel" }
       ];
   const overflow: ActionItem[] = isClaude
-    ? [{ label: "刷新模型", action: "refreshClaude" }, { label: "检测外部配置", action: "inspectClaude" }, { label: "删除此服务", action: "removeProvider" }]
+    ? [{ label: "刷新模型", action: "refreshClaude" }, { label: "模型映射（向导）", action: "mapClaudeModels" }, { label: "检测外部配置", action: "inspectClaude" }, { label: "删除此服务", action: "removeProvider" }]
     : [{ label: "刷新模型", action: "refreshCodex" }, { label: "配置连接代理", action: "configureCodexProxy" }, { label: "打开 Codex", action: "openCodex" }, { label: "删除此服务", action: "removeProvider" }];
   const usageInline: ActionItem[] = [
     { label: "刷新额度", action: "refreshUsage", primary: true },
@@ -673,4 +752,77 @@ function providerDetail(
     ? `<div class="detail-value"><span class="usage-pill configured">已配置额度 API</span><small class="url">${escapeHtml(provider.usageEndpoint ?? "")}</small>${provider.usageMappings ? `<small class="url">字段：${escapeHtml(provider.usageMappings)}</small>` : ""}</div>`
     : `<div class="detail-value"><span class="usage-pill">未配置额度 API</span><small class="url">可从此页面直接添加和管理</small></div>`;
   return `<article class="card">${detailTop(isClaude)}<div class="detail-heading"><span class="provider-icon">${isClaude ? "✦" : "⌁"}</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div><div class="detail-grid"><div class="detail-item"><span class="detail-label">连接状态</span><strong>${provider.active ? "当前服务" : "可用服务"}</strong></div><div class="detail-item"><span class="detail-label">${isClaude ? "模型与策略" : "模型缓存"}</span><strong>${mapping}</strong></div><div class="detail-item detail-wide"><span class="detail-label">额度配置</span>${usageDetail}</div></div><div class="detail-section"><div><h3>服务操作</h3><p>所有操作都针对当前选中的服务，不需要再从菜单二次选择。</p></div>${actionBar(inline, overflow, target)}</div><div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
+}
+
+const MODEL_ROLE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "", label: "不映射" },
+  { value: "main", label: "主模型" },
+  { value: "opus", label: "Opus" },
+  { value: "sonnet", label: "Sonnet" },
+  { value: "haiku", label: "Haiku（快速）" },
+  { value: "fable", label: "Fable" },
+  { value: "subagent", label: "子代理" }
+];
+
+const MODEL_EFFORT_OPTIONS = ["auto", "low", "medium", "high", "xhigh", "max"];
+
+/**
+ * The per-provider model editor: the cached model list, editable row by row,
+ * each with the mapping role it plays; the main model carries the 1M switch
+ * (the CLI runs it as `model[1m]`), and every Claude Desktop alias has its own
+ * 1M switch, since aliases resolve to different models with different context
+ * windows. A rejected draft wins over the stored values so nothing typed is
+ * lost on a validation error.
+ */
+function providerModelForm(
+  provider: ProviderManagerState["claudeProviders"][number],
+  edit: { draft?: ProviderModelFormPayload; notice?: string }
+): string {
+  const target: ActionTarget = { kind: "claude", id: provider.id };
+  const form = edit.draft ?? {
+    models: provider.modelList,
+    effort: provider.effortLevel,
+    desktopModels: provider.desktopModels
+  };
+  const notice = edit.notice
+    ? `<div class="form-notice" role="alert"><span>⚠</span><span>${escapeHtml(edit.notice)}</span></div>`
+    : "";
+  const effortOptions = (selected: string): string => MODEL_EFFORT_OPTIONS.map((option) =>
+    `<option value="${option}"${option === selected ? " selected" : ""}>${option}</option>`
+  ).join("");
+  const rows = form.models.length
+    ? form.models.map((row) => modelRow(row.name, row.role, row.supports1m)).join("")
+    : "";
+  const desktopRows = form.desktopModels.length
+    ? form.desktopModels.map((entry) => desktopModelRow(entry.name, entry.supports1m)).join("")
+    : "";
+  return `<article class="card model-form">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>模型与参数 — ${escapeHtml(provider.name)}</h2><small class="url">角色映射决定 Claude 各模型族与子代理使用哪个模型；1M 与 effort 会写入 VS Code、终端 CLI 与 Desktop 三端配置。</small></div></div>${notice}
+<div class="detail-section model-section"><div><h3>模型列表与角色</h3><p>模型 ID 将原样发送给网关。每个模型可扮演一个角色；同一角色重复时以第一个为准。每个角色可独立声明 1M 上下文（CLI 以模型名 [1m] 后缀使用）。</p></div></div>
+<div class="model-rows" id="model-rows">${rows}</div>
+<button class="ghost" type="button" data-model-add>＋ 添加模型</button>
+<template id="model-row-template">${modelRow("", "", false)}</template>
+<div class="detail-section model-section"><div><h3>Claude Desktop 模型名（可选）</h3><p>仅当网关的真实模型名不被 Desktop 接受时才需要（如 DeepSeek）。每个别名的 1M 开关独立：勾选后桌面选择器才会为它提供 1M 上下文变体。</p></div></div>
+<div class="desktop-model-rows" id="desktop-model-rows">${desktopRows}</div>
+<button class="ghost" type="button" data-desktop-add>＋ 添加桌面模型名</button>
+<template id="desktop-model-row-template">${desktopModelRow("", false)}</template>
+<div class="detail-grid">
+<div class="detail-item detail-wide"><span class="detail-label">推理强度（effort）</span><select id="model-effort" class="form-select">${effortOptions(form.effort)}</select><small class="field-hint">写入 CLAUDE_CODE_EFFORT_LEVEL。auto 由 Claude 自己决定。</small></div>
+</div>
+<div class="detail-section"><div><h3>保存</h3><p>${provider.active ? "该服务正在使用，保存后重新应用即生效。" : "保存后切换到此服务时即生效。"}</p></div>${actionBar(
+  [{ label: "保存", action: "saveProviderModels", primary: true }, { label: "取消", action: "cancelProviderModelEdit" }],
+  [],
+  target
+)}</div></article>`;
+}
+
+/** One editable model row: name input, role select, 1M switch, remove button. */
+function modelRow(name: string, role: string, supports1m: boolean): string {
+  return `<div class="model-row"><input class="model-name" type="text" value="${escapeHtml(name)}" placeholder="模型 ID，如 deepseek-v4-pro" spellcheck="false" autocomplete="off"><select class="model-role form-select">${MODEL_ROLE_OPTIONS.map((option) =>
+    `<option value="${option.value}"${option.value === role ? " selected" : ""}>${option.label}</option>`
+  ).join("")}</select><label class="check-row model-1m" title="该模型将以 [1m] 变体使用"><input type="checkbox"${supports1m ? " checked" : ""}><span>1M</span></label><button class="icon danger model-remove" type="button" title="删除此模型" aria-label="删除此模型">✕</button></div>`;
+}
+
+/** One editable Claude Desktop alias row: name input, 1M switch, remove button. */
+function desktopModelRow(name: string, supports1m: boolean): string {
+  return `<div class="desktop-model-row"><input class="desktop-model-name" type="text" value="${escapeHtml(name)}" placeholder="如 claude-sonnet-5" spellcheck="false" autocomplete="off"><label class="check-row" title="勾选后桌面选择器才会为它提供 1M 上下文变体"><input class="desktop-model-1m" type="checkbox"${supports1m ? " checked" : ""}><span>1M</span></label><button class="icon danger desktop-model-remove" type="button" title="删除此模型名" aria-label="删除此模型名">✕</button></div>`;
 }

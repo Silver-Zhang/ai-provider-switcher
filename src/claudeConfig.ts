@@ -16,9 +16,16 @@ export type ClaudeModelMapping = {
   sonnetModel: string;
   haikuModel: string;
   subagentModel: string;
+  /** Legacy switch: declared 1M support. Kept for stored data; prefer `longContextRoles`. */
   supports1m?: boolean;
+  /** Which roles run as the `[1m]` variant — each role is independently switchable. */
+  longContextRoles?: ClaudeModelRole[];
   effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | "auto";
 };
+
+/** The roles a mapped model can play; each one can declare 1M on its own. */
+export type ClaudeModelRole = "main" | "opus" | "sonnet" | "haiku" | "fable" | "subagent";
+export const CLAUDE_MODEL_ROLES: ClaudeModelRole[] = ["main", "opus", "sonnet", "haiku", "fable", "subagent"];
 export type ClaudePermissionStrategy = "auto" | "acceptEdits" | "manual" | "bypassPermissions";
 
 export const CLAUDE_ROUTING_ENV_NAMES = [
@@ -108,6 +115,7 @@ export function createClaudeModelMapping(
     haikuModel: fastModel.trim(),
     subagentModel: fastModel.trim(),
     supports1m,
+    longContextRoles: supports1m ? ["main", "fable", "opus", "sonnet"] : [],
     effortLevel
   };
 }
@@ -124,6 +132,12 @@ export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping 
   const effortLevel = ["low", "medium", "high", "xhigh", "max", "auto"].includes(effort)
     ? effort as ClaudeModelMapping["effortLevel"]
     : undefined;
+  // `longContextRoles` is authoritative; stored legacy `supports1m` maps onto
+  // the roles the old code used to suffix so nothing changes for old data.
+  const rawRoles = Array.isArray(value.longContextRoles) ? value.longContextRoles : undefined;
+  const longContextRoles: ClaudeModelRole[] = rawRoles
+    ? CLAUDE_MODEL_ROLES.filter((role) => (rawRoles as unknown[]).includes(role))
+    : value.supports1m === true ? ["main", "fable", "opus", "sonnet"] : [];
   return {
     mainModel,
     fableModel: stringValue(value.fableModel) || mainModel,
@@ -132,6 +146,7 @@ export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping 
     haikuModel,
     subagentModel,
     supports1m: value.supports1m === true,
+    longContextRoles,
     effortLevel
   };
 }
@@ -139,16 +154,17 @@ export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping 
 export function createClaudeModelEnvironment(mapping: ClaudeModelMapping): ClaudeEnvVar[] {
   const normalized = normalizeClaudeModelMapping(mapping);
   if (!normalized) return [];
-  const longContext = (model: string): string =>
-    normalized.supports1m && !model.endsWith("[1m]") ? `${model}[1m]` : model;
+  const oneM = (role: ClaudeModelRole): boolean => (normalized.longContextRoles ?? []).includes(role);
+  const longContext = (model: string, role: ClaudeModelRole): string =>
+    oneM(role) && !model.endsWith("[1m]") ? `${model}[1m]` : model;
   const entries: ClaudeEnvVar[] = [
-    { name: "ANTHROPIC_MODEL", value: longContext(normalized.mainModel) },
-    { name: "ANTHROPIC_DEFAULT_FABLE_MODEL", value: longContext(normalized.fableModel ?? normalized.mainModel) },
-    { name: "ANTHROPIC_DEFAULT_OPUS_MODEL", value: longContext(normalized.opusModel) },
-    { name: "ANTHROPIC_DEFAULT_SONNET_MODEL", value: longContext(normalized.sonnetModel) },
-    { name: "ANTHROPIC_DEFAULT_HAIKU_MODEL", value: normalized.haikuModel },
-    { name: "CLAUDE_CODE_SUBAGENT_MODEL", value: normalized.subagentModel },
-    { name: "ANTHROPIC_CUSTOM_MODEL_OPTION", value: longContext(normalized.mainModel) },
+    { name: "ANTHROPIC_MODEL", value: longContext(normalized.mainModel, "main") },
+    { name: "ANTHROPIC_DEFAULT_FABLE_MODEL", value: longContext(normalized.fableModel ?? normalized.mainModel, "fable") },
+    { name: "ANTHROPIC_DEFAULT_OPUS_MODEL", value: longContext(normalized.opusModel, "opus") },
+    { name: "ANTHROPIC_DEFAULT_SONNET_MODEL", value: longContext(normalized.sonnetModel, "sonnet") },
+    { name: "ANTHROPIC_DEFAULT_HAIKU_MODEL", value: longContext(normalized.haikuModel, "haiku") },
+    { name: "CLAUDE_CODE_SUBAGENT_MODEL", value: longContext(normalized.subagentModel, "subagent") },
+    { name: "ANTHROPIC_CUSTOM_MODEL_OPTION", value: longContext(normalized.mainModel, "main") },
     { name: "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", value: normalized.mainModel },
     { name: "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", value: "Custom model mapped by AI Provider Switcher" },
     { name: "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", value: normalized.fableModel ?? normalized.mainModel },
@@ -408,6 +424,8 @@ export function getDeepSeekClaudeModelMapping(): ClaudeModelMapping {
     haikuModel: "deepseek-v4-flash",
     subagentModel: "deepseek-v4-flash",
     supports1m: true,
+    // DeepSeek V4 serves a 1M window on both the pro and the flash model.
+    longContextRoles: ["main", "opus", "sonnet", "haiku", "fable", "subagent"],
     effortLevel: "max"
   };
 }

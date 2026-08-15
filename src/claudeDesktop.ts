@@ -68,6 +68,8 @@ export type ClaudeDesktopModelEntry = {
   /** Breaks the tie when several entries claim the same tier. */
   isFamilyDefault?: boolean;
   supports1m?: boolean;
+  /** Makes the 1M variant the default picker selection; needs `supports1m`. */
+  prefer1m?: boolean;
   /** Display-only name in the app's model picker; the ID sent upstream is `name`. */
   labelOverride?: string;
 };
@@ -108,6 +110,8 @@ export type ClaudeDesktopTierHints = Partial<Record<ClaudeDesktopTier, string>> 
   /** Becomes the first entry, which the app uses as the default model. */
   defaultModel?: string;
   supports1m?: boolean;
+  /** Start the picker on the 1M variant; only meaningful with `supports1m`. */
+  prefer1m?: boolean;
 };
 
 /**
@@ -141,7 +145,10 @@ export function buildClaudeDesktopModelEntries(
         claimed.add(tier);
       }
     }
-    if (hints.supports1m && name === hints.defaultModel?.trim()) entry.supports1m = true;
+    if (hints.supports1m && name === hints.defaultModel?.trim()) {
+      entry.supports1m = true;
+      if (hints.prefer1m) entry.prefer1m = true;
+    }
     return entry;
   });
   return { entries, rejected };
@@ -153,15 +160,17 @@ export function buildClaudeDesktopModelEntries(
  * gateway maps Claude names onto its own models — which the common
  * Anthropic-compatible endpoints do (DeepSeek's `/anthropic` routes
  * `claude-opus-*` to its pro model and every other `claude-*` name to its fast
- * one). Sonnet leads because the app treats the first entry as the default.
+ * one). Sonnet leads because the app treats the first entry as the default, and
+ * the names track the current Claude generations so the picker does not look
+ * dated.
  */
 export const CLAUDE_DESKTOP_ALIAS_MODELS = [
-  "claude-sonnet-4-5",
-  "claude-opus-4-5",
-  "claude-haiku-4-5"
+  "claude-sonnet-5",
+  "claude-opus-5",
+  "claude-haiku-5"
 ] as const;
 
-/** The tier an Anthropic-style ID names, e.g. `claude-opus-4-5` → `opus`. */
+/** The tier an Anthropic-style ID names, e.g. `claude-opus-5` → `opus`. */
 export function inferClaudeDesktopTier(name: string): ClaudeDesktopTier | undefined {
   const model = name.trim().toLowerCase();
   return CLAUDE_DESKTOP_TIERS.find((tier) => new RegExp(`(^|[^a-z])${tier}([^a-z]|$)`).test(model));
@@ -184,11 +193,17 @@ function formatClaudeDesktopLabel(
  * discovery path the tier is read from the alias itself, since the alias exists
  * precisely because the gateway's real model names could not be used. `source`
  * labels the entries with the gateway they resolve to, so the picker does not
- * look like it is offering genuine Claude models.
+ * look like it is offering genuine Claude models. The 1M declaration is
+ * per-entry: `options.supports1m` is a capability assertion applied to every
+ * alias when a plain `true`, or a predicate consulted per name when different
+ * aliases resolve to models with different context windows. `options.prefer1m`
+ * additionally makes the default (first) entry's 1M variant the picker's
+ * default selection, when that entry advertises one.
  */
 export function buildClaudeDesktopAliasEntries(
   names: readonly string[],
-  source = ""
+  source = "",
+  options: { supports1m?: boolean | ((name: string) => boolean); prefer1m?: boolean } = {}
 ): { entries: ClaudeDesktopModelEntry[]; rejected: string[] } {
   const seen = new Set<string>();
   const usable: string[] = [];
@@ -212,8 +227,13 @@ export function buildClaudeDesktopAliasEntries(
     }
     const label = formatClaudeDesktopLabel(name, tier, source);
     if (label) entry.labelOverride = label;
+    const oneM = typeof options.supports1m === "function"
+      ? options.supports1m(name) === true
+      : options.supports1m === true;
+    if (oneM) entry.supports1m = true;
     return entry;
   });
+  if (options.prefer1m && entries[0]?.supports1m === true) entries[0].prefer1m = true;
   return { entries, rejected };
 }
 

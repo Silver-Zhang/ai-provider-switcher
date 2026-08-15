@@ -48,7 +48,9 @@ import {
   ProviderManagerDraft,
   ProviderManagerMessage,
   ProviderManagerPanel,
-  ProviderManagerState
+  ProviderManagerState,
+  ProviderModelFormPayload,
+  ProviderModelRow
 } from "./providerManagerPanel";
 import {
   ProviderEditDraft,
@@ -74,9 +76,11 @@ import {
 } from "./providerUsage";
 import {
   ClaudeModelMapping,
+  ClaudeModelRole,
   ClaudePermissionStrategy,
   ClaudeConfigurationFinding,
   CLAUDE_MODEL_ENV_NAMES,
+  CLAUDE_MODEL_ROLES,
   CLAUDE_PROVIDER_ENV_NAMES,
   DEEPSEEK_CLAUDE_MODEL_ENV_NAMES,
   clearClaudeManagedJsonEnv,
@@ -140,6 +144,8 @@ type GatewayProfile = {
    * model names, for gateways whose real names the desktop app refuses.
    */
   desktopModels?: string[];
+  /** Aliases whose desktop entries advertise the 1M-context variant. */
+  desktopModel1m?: string[];
 };
 type GatewayModels = { gatewayId: string; models: string[]; updatedAt: string };
 type CodexProviderProfile = { id: string; name: string; baseUrl: string; usage?: ProviderUsageConfiguration };
@@ -409,13 +415,16 @@ function getProviderManagerState(): ProviderManagerState {
       baseUrl: provider.baseUrl,
       active: provider.id === currentClaudeProvider?.id,
       mapping: provider.modelMapping
-        ? `${provider.modelMapping.mainModel} / 快速：${provider.modelMapping.haikuModel}${provider.modelMapping.supports1m ? " / 1M" : ""}`
+        ? `${provider.modelMapping.mainModel} / 快速：${provider.modelMapping.haikuModel}${provider.modelMapping.longContextRoles?.includes("main") ? " / 1M" : ""}`
         : "未配置",
       permissionStrategy: getClaudePermissionStrategyLabel(provider.permissionStrategy),
       hasUsageConfig: Boolean(provider.usage),
       usageEndpoint: provider.usage?.endpoint,
       usageMappings: formatUsageMappings(provider.usage),
-      usage: formatProviderUsageSummary(usage.get(`claude:${provider.id}`))
+      usage: formatProviderUsageSummary(usage.get(`claude:${provider.id}`)),
+      modelList: claudeModelRows(provider),
+      effortLevel: provider.modelMapping?.effortLevel ?? "auto",
+      desktopModels: desktopAliasRows(provider)
     })),
     codexMode: getCodexModeLabel(),
     codexOfficial: !getCodexProviders().some((provider) => provider.id === activeCodexId),
@@ -439,6 +448,116 @@ function getCodexModeLabel(): string {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   const id = settings.get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
   return getCodexProviders().find((provider) => provider.id === id)?.name ?? "官方服务";
+}
+
+/** The model editor rows for one gateway: cached IDs plus the mapping role each one plays. */
+function claudeModelRows(gateway: GatewayProfile): ProviderModelRow[] {
+  const mapping = gateway.modelMapping;
+  const roleOf = (name: string): string => {
+    if (!mapping) return "";
+    if (name === mapping.mainModel) return "main";
+    if (name === mapping.opusModel) return "opus";
+    if (name === mapping.sonnetModel) return "sonnet";
+    if (name === mapping.haikuModel) return "haiku";
+    if (name === mapping.fableModel) return "fable";
+    if (name === mapping.subagentModel) return "subagent";
+    return "";
+  };
+  return (getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? []).map(
+    (name) => {
+      const role = roleOf(name);
+      const oneM = role !== "" && mapping?.longContextRoles?.includes(role as ClaudeModelRole) === true;
+      return { name, role, supports1m: oneM };
+    }
+  );
+}
+
+/** Desktop alias rows: each stored alias with its own 1M switch state. */
+function desktopAliasRows(gateway: GatewayProfile): Array<{ name: string; supports1m: boolean }> {
+  const oneM = new Set(gateway.desktopModel1m ?? []);
+  const defaultName = gateway.desktopModels?.[0];
+  const main1m = gateway.modelMapping?.longContextRoles?.includes("main") === true;
+  return (gateway.desktopModels ?? []).map((name) => ({
+    name,
+    supports1m: oneM.has(name) || (main1m && name === defaultName)
+  }));
+}
+
+/**
+ * Persists the per-provider model editor: the model list becomes the gateway's
+ * model cache, the role assignments become its model mapping (plus effort and
+ * the 1M declaration), and the desktop aliases are stored alongside. A form the
+ * user left unassignable is rejected and kept open rather than silently
+ * dropping the mapping.
+ */
+async function saveClaudeProviderModels(
+  gatewayId: string,
+  form: ProviderModelFormPayload
+): Promise<ProviderManagerActionResult | void> {
+  const gateway = getGateways().find((item) => item.id === gatewayId);
+  if (!gateway) return undefined;
+  const seen = new Set<string>();
+  const names: string[] = [];
+  const duplicates: string[] = [];
+  for (const row of form.models) {
+    const name = row.name.trim();
+    if (!name) continue;
+    if (seen.has(name)) { duplicates.push(name); continue; }
+    seen.add(name);
+    names.push(name);
+  }
+  if (names.length === 0) {
+    return { keepEditing: true, message: "请至少填写一个模型 ID。" };
+  }
+  const claimed = new Set<string>();
+  const pick = (role: string): string | undefined => {
+    if (claimed.has(role)) return undefined;
+    const row = form.models.find((item) => item.role === role && item.name.trim());
+    if (!row) return undefined;
+    claimed.add(role);
+    return row.name.trim();
+  };
+  const mainRow = form.models.find((item) => item.role === "main" && item.name.trim());
+  // Every role with a model row and a checked 1M switch becomes a long-context role.
+  const longContextRoles = CLAUDE_MODEL_ROLES.filter((role) =>
+    form.models.some((item) => item.role === role && item.supports1m && item.name.trim())
+  );
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: pick("main"),
+    opusModel: pick("opus"),
+    sonnetModel: pick("sonnet"),
+    haikuModel: pick("haiku"),
+    fableModel: pick("fable"),
+    subagentModel: pick("subagent"),
+    effortLevel: form.effort,
+    supports1m: mainRow?.supports1m === true,
+    longContextRoles
+  });
+  const desktopNames: string[] = [];
+  const desktop1m: string[] = [];
+  const rejectedDesktop: string[] = [];
+  for (const row of form.desktopModels) {
+    const name = row.name.trim();
+    if (!name || desktopNames.includes(name)) continue;
+    if (!isClaudeDesktopCompatibleModel(name)) { rejectedDesktop.push(name); continue; }
+    desktopNames.push(name);
+    if (row.supports1m) desktop1m.push(name);
+  }
+  await saveGatewayModels(gateway.id, names);
+  await updateGatewayProfile({
+    ...gateway,
+    modelMapping: mapping,
+    desktopModels: desktopNames.length > 0 ? desktopNames : undefined,
+    desktopModel1m: desktop1m.length > 0 ? desktop1m : undefined
+  });
+  const notes: string[] = [];
+  if (duplicates.length > 0) notes.push(`已跳过重复模型：${duplicates.join("、")}`);
+  if (rejectedDesktop.length > 0) notes.push(`Claude Desktop 不接受这些模型名，已跳过：${rejectedDesktop.join("、")}`);
+  if (getCurrentClaudeProvider()?.id === gateway.id) {
+    notes.push("该服务正在使用，请“重新应用此服务”让修改生效。");
+  }
+  vscode.window.showInformationMessage([`已保存“${gateway.name}”的 ${names.length} 个模型与参数。`, ...notes].join(" "));
+  return undefined;
 }
 
 function getUsageProviderById(
@@ -477,6 +596,9 @@ async function handleProviderManagerAction(
     return message.providerKind === "claude"
       ? saveClaudeProviderEdit(context, message.providerId, message.draft)
       : saveCodexProviderEdit(context, message.providerId, message.draft);
+  }
+  if (action === "saveProviderModels" && message.providerId && message.modelForm) {
+    return saveClaudeProviderModels(message.providerId, message.modelForm);
   }
   if (action === "reorderProviders" && message.providerKind && message.order) {
     await reorderProviders(message.providerKind, message.order);
@@ -1238,18 +1360,30 @@ function getClaudeDesktopModelEntries(gateway: GatewayProfile): {
   entries: ClaudeDesktopModelEntry[];
   rejected: string[];
 } {
+  const mapping = normalizeClaudeModelMapping(gateway.modelMapping);
   if (gateway.desktopModels?.length) {
-    return buildClaudeDesktopAliasEntries(gateway.desktopModels, gateway.name);
+    // The alias path also carries the 1M claims, otherwise a gateway reached
+    // through aliases (DeepSeek) never gets the context option even when its
+    // mapping declares 1M support. Each alias has its own switch — aliases
+    // resolve to different models with different context windows — and the
+    // main model's 1M declaration lights up the default (first) alias.
+    const alias1m = new Set(gateway.desktopModel1m ?? []);
+    const defaultAlias = gateway.desktopModels[0];
+    const main1m = mapping?.longContextRoles?.includes("main") === true;
+    return buildClaudeDesktopAliasEntries(gateway.desktopModels, gateway.name, {
+      supports1m: (name) => alias1m.has(name) || (main1m && name === defaultAlias),
+      prefer1m: main1m
+    });
   }
   const models = getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? [];
-  const mapping = normalizeClaudeModelMapping(gateway.modelMapping);
   return buildClaudeDesktopModelEntries(models, {
     defaultModel: mapping?.mainModel,
     opus: mapping?.opusModel,
     sonnet: mapping?.sonnetModel,
     haiku: mapping?.haikuModel,
     fable: mapping?.fableModel,
-    supports1m: mapping?.supports1m
+    supports1m: mapping?.supports1m,
+    prefer1m: mapping?.supports1m
   });
 }
 
@@ -1420,8 +1554,12 @@ async function switchClaudeDesktop(context: vscode.ExtensionContext): Promise<vo
   if (!gateway) return;
   const proceed = await confirmClaudeDesktopSwitch(gateway.name);
   if (!proceed) return;
-  const { entries, rejected } = getClaudeDesktopModelEntries(gateway);
+  let { entries, rejected } = getClaudeDesktopModelEntries(gateway);
   if (!(await confirmClaudeDesktopModels(context, gateway, entries, rejected))) return;
+  // The confirmation may have just attached desktop aliases to the gateway;
+  // rebuild the list so the stored entry matches what was confirmed instead of
+  // the (possibly empty) list computed before the prompt.
+  ({ entries } = getClaudeDesktopModelEntries(gateway));
   const token = await getOrRequestGatewayToken(context, gateway);
   if (!token) return;
   try {
@@ -1514,10 +1652,18 @@ async function saveGatewayDesktopModels(gatewayId: string, names: string[]): Pro
     const record = item as Record<string, unknown>;
     if (String(record.id ?? "").trim() !== gatewayId) return item;
     if (names.length === 0) {
-      const { desktopModels: _dropped, ...rest } = record;
+      const { desktopModels: _dropped, desktopModel1m: _dropped1m, ...rest } = record;
       return rest;
     }
-    return { ...record, desktopModels: names };
+    // Aliases that no longer exist must not keep a stale 1M claim.
+    const kept1m = Array.isArray(record.desktopModel1m)
+      ? record.desktopModel1m.filter((name) => typeof name === "string" && names.includes(name))
+      : [];
+    return {
+      ...record,
+      desktopModels: names,
+      desktopModel1m: kept1m.length > 0 ? kept1m : undefined
+    };
   });
   await settings.update("gateways", next, vscode.ConfigurationTarget.Global);
 }
@@ -2174,6 +2320,12 @@ async function configureClaudeModelMapping(
   });
   if (!supports1m) return undefined;
   mapping.supports1m = supports1m.value;
+  // The wizard manages the four roles the legacy switch covered; per-role
+  // refinement (haiku, subagent) belongs to the panel's model editor, whose
+  // choices are preserved when the wizard is not used.
+  mapping.longContextRoles = supports1m.value
+    ? ["main", "fable", "opus", "sonnet"]
+    : existing?.longContextRoles?.filter((role) => role !== "main" && role !== "fable" && role !== "opus" && role !== "sonnet") ?? [];
 
   const effort = await vscode.window.showQuickPick([
     { label: "不强制（推荐）", description: "由 Claude Code 和模型自行决定", value: undefined },
@@ -4214,7 +4366,8 @@ function getGateways(): GatewayProfile[] {
           (isDeepSeekAnthropicApi(baseUrl) ? getDeepSeekClaudeModelMapping() : undefined),
         permissionStrategy: normalizeClaudePermissionStrategy(item.permissionStrategy),
         usage: normalizeUsageConfiguration(item.usage),
-        desktopModels: normalizeDesktopModelNames(item.desktopModels)
+        desktopModels: normalizeDesktopModelNames(item.desktopModels),
+        desktopModel1m: normalizeDesktopModelNames(item.desktopModel1m)
       };
     })
     .filter((gateway) => gateway.id && gateway.name && gateway.baseUrl);

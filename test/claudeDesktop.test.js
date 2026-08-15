@@ -279,9 +279,9 @@ test("only a gateway entry reports a base URL", () => {
 
 test("the standard alias set is one entry per tier and all names pass the app's check", () => {
   assert.deepEqual([...CLAUDE_DESKTOP_ALIAS_MODELS], [
-    "claude-sonnet-4-5",
-    "claude-opus-4-5",
-    "claude-haiku-4-5"
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-haiku-5"
   ]);
   for (const name of CLAUDE_DESKTOP_ALIAS_MODELS) {
     assert.equal(isClaudeDesktopCompatibleModel(name), true, name);
@@ -304,9 +304,9 @@ test("aliases carry their own tier, a family default, and the gateway label", ()
   const { entries, rejected } = buildClaudeDesktopAliasEntries([...CLAUDE_DESKTOP_ALIAS_MODELS], "deepseek");
   assert.deepEqual(rejected, []);
   assert.deepEqual(entries, [
-    { name: "claude-sonnet-4-5", anthropicFamilyTier: "sonnet", isFamilyDefault: true, labelOverride: "Sonnet · deepseek" },
-    { name: "claude-opus-4-5", anthropicFamilyTier: "opus", isFamilyDefault: true, labelOverride: "Opus · deepseek" },
-    { name: "claude-haiku-4-5", anthropicFamilyTier: "haiku", isFamilyDefault: true, labelOverride: "Haiku · deepseek" }
+    { name: "claude-sonnet-5", anthropicFamilyTier: "sonnet", isFamilyDefault: true, labelOverride: "Sonnet · deepseek" },
+    { name: "claude-opus-5", anthropicFamilyTier: "opus", isFamilyDefault: true, labelOverride: "Opus · deepseek" },
+    { name: "claude-haiku-5", anthropicFamilyTier: "haiku", isFamilyDefault: true, labelOverride: "Haiku · deepseek" }
   ]);
 });
 
@@ -315,6 +315,66 @@ test("the first alias claiming a tier is the only family default", () => {
   assert.equal(entries[0].isFamilyDefault, true);
   assert.equal(entries[1].isFamilyDefault, undefined);
   assert.equal(entries[1].anthropicFamilyTier, "opus");
+});
+
+test("aliases advertise 1M on every entry and prefer it on the default", () => {
+  const { entries } = buildClaudeDesktopAliasEntries(
+    [...CLAUDE_DESKTOP_ALIAS_MODELS],
+    "deepseek",
+    { supports1m: true, prefer1m: true }
+  );
+  assert.equal(entries[0].name, "claude-sonnet-5");
+  assert.equal(entries[0].supports1m, true);
+  assert.equal(entries[0].prefer1m, true);
+  // The capability applies to every alias: the opus alias resolves to the
+  // gateway's pro model, which deserves the context option just as much.
+  assert.equal(entries[1].supports1m, true);
+  assert.equal(entries[1].prefer1m, undefined);
+  assert.equal(entries[2].supports1m, true);
+  assert.equal(entries[2].prefer1m, undefined);
+  // Supports without prefer leaves the picker on the standard variant.
+  const supportsOnly = buildClaudeDesktopAliasEntries(
+    [...CLAUDE_DESKTOP_ALIAS_MODELS],
+    "deepseek",
+    { supports1m: true }
+  );
+  assert.equal(supportsOnly.entries[0].supports1m, true);
+  assert.equal(supportsOnly.entries[0].prefer1m, undefined);
+  assert.equal(supportsOnly.entries[1].supports1m, true);
+  // Without the flag the alias entries stay as before.
+  const plain = buildClaudeDesktopAliasEntries([...CLAUDE_DESKTOP_ALIAS_MODELS], "deepseek");
+  assert.equal(plain.entries[0].supports1m, undefined);
+});
+
+test("each alias can declare 1M on its own through a predicate", () => {
+  // The opus alias resolves to a pro model with a 1M window; the fast tiers stay standard.
+  const { entries } = buildClaudeDesktopAliasEntries(
+    [...CLAUDE_DESKTOP_ALIAS_MODELS],
+    "deepseek",
+    { supports1m: (name) => name === "claude-opus-5", prefer1m: false }
+  );
+  assert.equal(entries.find((entry) => entry.name === "claude-opus-5").supports1m, true);
+  assert.equal(entries.find((entry) => entry.name === "claude-sonnet-5").supports1m, undefined);
+  assert.equal(entries.find((entry) => entry.name === "claude-haiku-5").supports1m, undefined);
+  // prefer1m never lands on an entry that does not advertise 1M.
+  const preferred = buildClaudeDesktopAliasEntries(
+    [...CLAUDE_DESKTOP_ALIAS_MODELS],
+    "deepseek",
+    { supports1m: (name) => name === "claude-opus-5", prefer1m: true }
+  );
+  assert.equal(preferred.entries[0].prefer1m, undefined);
+  assert.equal(preferred.entries.find((entry) => entry.name === "claude-opus-5").supports1m, true);
+});
+
+test("the discovered default model can be preferred at 1M", () => {
+  const { entries } = buildClaudeDesktopModelEntries(["claude-opus-4-8"], {
+    defaultModel: "claude-opus-4-8",
+    opus: "claude-opus-4-8",
+    supports1m: true,
+    prefer1m: true
+  });
+  assert.equal(entries[0].supports1m, true);
+  assert.equal(entries[0].prefer1m, true);
 });
 
 test("aliases the app would refuse are reported instead of written", () => {
@@ -357,5 +417,5 @@ test("alias entries survive a round trip through the desktop config", () => {
     })
   );
   assert.deepEqual(config.inferenceModels, entries);
-  assert.equal(config.inferenceModels[0].name, "claude-sonnet-4-5");
+  assert.equal(config.inferenceModels[0].name, "claude-sonnet-5");
 });
