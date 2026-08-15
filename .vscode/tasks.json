@@ -54,11 +54,6 @@
 					]
 				}
 			}
-		},
-		{
-			"label": "ai-provider-switcher: commit tasks cleanup",
-			"type": "shell",
-			"command": "git add .vscode/tasks.json && git commit -m \"chore: trim tasks.json to the four tasks used in the release workflow\" && git push origin main"
 		}
 	]
 }
