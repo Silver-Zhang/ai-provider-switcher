@@ -43,47 +43,22 @@
 		{
 			"label": "ai-provider-switcher: package and install",
 			"type": "shell",
-			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.0.vsix --force"
+			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.0.vsix --force",
+			"options": {
+				"shell": {
+					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
+					"args": [
+						"/d",
+						"/s",
+						"/c"
+					]
+				}
+			}
 		},
 		{
-			"label": "verify installed version",
+			"label": "ai-provider-switcher: commit tasks cleanup",
 			"type": "shell",
-			"command": "code --list-extensions --show-versions | findstr /i ai-provider"
-		},
-		{
-			"label": "ai-provider-switcher: git status",
-			"type": "shell",
-			"command": "git --no-pager status --short && echo ==== && git --no-pager diff --stat --ignore-space-at-eol | tail -8"
-		},
-		{
-			"label": "ai-provider-switcher: git log",
-			"type": "shell",
-			"command": "git --no-pager log --oneline -10"
-		},
-		{
-			"label": "ai-provider-switcher: final test",
-			"type": "shell",
-			"command": "npm test"
-		},
-		{
-			"label": "ai-provider-switcher: stage and review",
-			"type": "shell",
-			"command": "git add -A && git status --short && git --no-pager diff --cached --stat | tail -30"
-		},
-		{
-			"label": "ai-provider-switcher: commit, tag and push",
-			"type": "shell",
-			"command": "git commit -m \"feat: Claude CLI sync, Claude Desktop management, and release 0.5.0\" -m \"Sync the terminal Claude CLI via ~/.claude/settings.json env, add independent Claude Desktop management through the app's 3P config library with model aliases and install discovery, add Remote-SSH/WSL/container awareness, and improve gateway model discovery. Sync the README's English sections with the Chinese docs.\" && git tag -a v0.5.0 -m \"AI Provider Switcher 0.5.0\" && git push origin main --tags"
-		},
-		{
-			"label": "ai-provider-switcher: package release",
-			"type": "shell",
-			"command": "npx vsce package && dir /b *.vsix && where gh && gh auth status"
-		},
-		{
-			"label": "ai-provider-switcher: create GitHub release",
-			"type": "shell",
-			"command": "gh release create v0.5.0 ai-provider-switcher-0.5.0.vsix --title \"AI Provider Switcher 0.5.0\" --notes-file release-notes-0.5.0.md --repo Silver-Zhang/ai-provider-switcher && del release-notes-0.5.0.md"
+			"command": "git add .vscode/tasks.json && git commit -m \"chore: trim tasks.json to the four tasks used in the release workflow\" && git push origin main"
 		}
 	]
 }
