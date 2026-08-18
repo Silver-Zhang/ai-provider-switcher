@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.5.1",
+  "version": "0.5.5",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -215,6 +215,13 @@
                   "type": "string"
                 }
               },
+              "desktopModel1m": {
+                "type": "array",
+                "description": "Which of this gateway's Claude Desktop aliases advertise the 1M-context variant. Aliases resolve to different upstream models, so each one declares its own context window.",
+                "items": {
+                  "type": "string"
+                }
+              },
               "modelMapping": {
                 "type": "object",
                 "description": "Optional mapping from Claude model families and agents to model IDs accepted by this Anthropic-compatible provider.",
@@ -246,7 +253,30 @@
                   },
                   "supports1m": {
                     "type": "boolean",
-                    "default": false
+                    "default": false,
+                    "description": "Legacy gateway-wide 1M declaration, superseded by longContextModels. Written for compatibility and re-derived on read; editing it by hand has no effect once longContextModels is present."
+                  },
+                  "longContextRoles": {
+                    "type": "array",
+                    "description": "Legacy per-role 1M declaration, superseded by longContextModels. Written for compatibility and re-derived on read; editing it by hand has no effect once longContextModels is present.",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "main",
+                        "fable",
+                        "opus",
+                        "sonnet",
+                        "haiku",
+                        "subagent"
+                      ]
+                    }
+                  },
+                  "longContextModels": {
+                    "type": "array",
+                    "description": "Model IDs served with a 1M context window. Each one is sent as `<model>[1m]` in every role it fills, and is offered the 1M option in Claude Desktop.",
+                    "items": {
+                      "type": "string"
+                    }
                   },
                   "effortLevel": {
                     "type": "string",
@@ -458,7 +488,10 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && node --test test/*.test.js"
+    "test": "npm run compile && node --test test/*.test.js",
+    "package": "vsce package",
+    "install:vsix": "node scripts/install-vsix.cjs",
+    "install:vsix:insiders": "node scripts/install-vsix.cjs --insiders"
   },
   "devDependencies": {
     "@types/node": "^20.14.12",

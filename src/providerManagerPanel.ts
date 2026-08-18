@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { CLAUDE_DESKTOP_ALIAS_MODELS } from "./claudeDesktop";
 
 export type ProviderManagerAction =
   | "ready"
@@ -36,6 +37,8 @@ export type ProviderManagerAction =
   | "editProviderModels"
   | "cancelProviderModelEdit"
   | "saveProviderModels"
+  | "autoAssignModelRoles"
+  | "fetchProviderModels"
   | "openCodex";
 
 export type ProviderManagerDraft = { name: string; baseUrl: string; secret?: string };
@@ -62,9 +65,14 @@ export type ProviderManagerMessage = {
 /**
  * `keepEditing` holds the form open so a rejected draft is not discarded, and `message` is shown
  * inline above the fields — a validation error belongs next to the input that caused it, not in a
- * notification toast detached from the form.
+ * notification toast detached from the form. `modelForm` lets the host hand back a recomputed
+ * draft (roles it assigned, models it fetched) to be rendered in place of what was submitted.
  */
-export type ProviderManagerActionResult = { keepEditing?: boolean; message?: string };
+export type ProviderManagerActionResult = {
+  keepEditing?: boolean;
+  message?: string;
+  modelForm?: ProviderModelFormPayload;
+};
 
 export type ProviderManagerState = {
   claudeMode: string;
@@ -91,6 +99,11 @@ export type ProviderManagerState = {
     modelList: ProviderModelRow[];
     effortLevel: string;
     desktopModels: Array<{ name: string; supports1m: boolean }>;
+    /**
+     * True when none of the gateway's own model IDs are ones Claude Desktop
+     * will accept, so aliases are the only way to reach it from the app.
+     */
+    desktopAliasRequired: boolean;
   }>;
   codexMode: string;
   codexOfficial: boolean;
@@ -194,9 +207,17 @@ export class ProviderManagerPanel {
       if (message.action === "saveProviderEdit") {
         this.editing = result?.keepEditing === true;
         this.retainDraft(this.editing ? message.draft : undefined, result?.message);
-      } else if (message.action === "saveProviderModels") {
+      } else if (
+        message.action === "saveProviderModels"
+        || message.action === "autoAssignModelRoles"
+        || message.action === "fetchProviderModels"
+      ) {
         this.editingModels = result?.keepEditing === true;
-        this.pendingModelForm = this.editingModels ? message.modelForm : undefined;
+        // A host-recomputed draft wins over what was submitted — that is how the
+        // assigned roles and the fetched models get back onto the screen.
+        this.pendingModelForm = this.editingModels
+          ? result?.modelForm ?? message.modelForm
+          : undefined;
         this.notice = result?.message;
       } else {
         this.notice = undefined;
@@ -398,6 +419,12 @@ export class ProviderManagerPanel {
     .model-rows, .desktop-model-rows { display: grid; gap: 8px; margin-top: 12px; }
     .model-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px 54px 28px; gap: 8px; align-items: center; }
     .model-1m { justify-self: start; }
+    .row-tools { display: flex; flex-wrap: wrap; gap: 8px; }
+    .env-preview { display: grid; gap: 3px; padding: 11px 13px; border: 1px solid var(--vscode-widget-border); border-radius: 10px; background: var(--vscode-textCodeBlock-background, var(--vscode-sideBar-background)); font-family: var(--vscode-editor-font-family, monospace); font-size: 11.5px; overflow-x: auto; }
+    .env-preview div { display: flex; gap: 8px; white-space: nowrap; }
+    .env-preview b { flex: 0 0 auto; color: var(--vscode-descriptionForeground); font-weight: 400; }
+    .env-preview i { font-style: normal; color: var(--vscode-textLink-foreground); }
+    .env-preview .env-empty { color: var(--vscode-descriptionForeground); font-family: var(--vscode-font-family); }
     .desktop-model-row { display: grid; grid-template-columns: minmax(0, 1fr) 54px 28px; gap: 8px; align-items: center; }
     .model-section { align-items: start; }
     .check-row { display: flex; gap: 6px; align-items: center; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.5; }
@@ -455,11 +482,66 @@ export class ProviderManagerPanel {
       const container = document.getElementById('model-rows');
       if (template && container) container.appendChild(template.content.cloneNode(true));
     };
-    const addDesktopModelRow = () => {
+    const addDesktopModelRow = (name) => {
       const template = document.getElementById('desktop-model-row-template');
       const container = document.getElementById('desktop-model-rows');
-      if (template && container) container.appendChild(template.content.cloneNode(true));
+      if (!template || !container) return;
+      const fragment = template.content.cloneNode(true);
+      if (name) fragment.querySelector('.desktop-model-name').value = name;
+      container.appendChild(fragment);
     };
+    const fillStandardAliases = (names) => {
+      const container = document.getElementById('desktop-model-rows');
+      if (!container) return;
+      const present = new Set(Array.from(container.querySelectorAll('.desktop-model-name'))
+        .map((field) => field.value.trim()));
+      names.filter((name) => !present.has(name)).forEach(addDesktopModelRow);
+    };
+
+    // A preview of what the host will write. The authority is
+    // createClaudeModelEnvironment in claudeConfig.ts; this mirrors its two
+    // rules — unassigned roles fall back to the main model, and a model with 1M
+    // ticked carries the [1m] suffix — so the effect is visible before saving.
+    const ENV_ROLES = [
+      ['ANTHROPIC_MODEL', 'main'],
+      ['ANTHROPIC_DEFAULT_OPUS_MODEL', 'opus'],
+      ['ANTHROPIC_DEFAULT_SONNET_MODEL', 'sonnet'],
+      ['ANTHROPIC_DEFAULT_HAIKU_MODEL', 'haiku'],
+      ['ANTHROPIC_DEFAULT_FABLE_MODEL', 'fable'],
+      ['CLAUDE_CODE_SUBAGENT_MODEL', 'subagent']
+    ];
+    const renderPreview = () => {
+      const box = document.getElementById('env-preview');
+      if (!box) return;
+      const form = readModelForm();
+      const rows = form.models.filter((row) => row.name);
+      const of = (role) => rows.find((row) => row.role === role);
+      const main = of('main');
+      if (!main) {
+        box.innerHTML = '<div class="env-empty">把一个模型的角色设为「主模型」后，这里会显示最终写入的模型名。</div>';
+        return;
+      }
+      const haiku = of('haiku') || main;
+      const resolve = (role) => {
+        if (role === 'haiku') return haiku;
+        if (role === 'subagent') return of('subagent') || haiku;
+        return of(role) || main;
+      };
+      const lines = ENV_ROLES.map(([variable, role]) => {
+        const row = resolve(role);
+        const value = row.supports1m ? row.name + '[1m]' : row.name;
+        return '<div><b>' + variable + '=</b><i>' + escapeText(value) + '</i></div>';
+      });
+      // Mirrors createClaudeModelEnvironment: any non-empty effort is written,
+      // 'auto' included. Only the empty choice omits the variable.
+      const effort = fieldValue('model-effort');
+      if (effort) {
+        lines.push('<div><b>CLAUDE_CODE_EFFORT_LEVEL=</b><i>' + escapeText(effort) + '</i></div>');
+      }
+      box.innerHTML = lines.join('');
+    };
+    const escapeText = (value) => value.replace(/[&<>]/g, (character) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[character]);
     const send = (element) => vscode.postMessage({
       action: element.dataset.action,
       providerKind: element.dataset.providerKind,
@@ -475,12 +557,26 @@ export class ProviderManagerPanel {
     document.addEventListener('click', (event) => {
       const menu = closest(event, 'details.overflow');
       document.querySelectorAll('details.overflow[open]').forEach((open) => { if (open !== menu) open.open = false; });
-      if (closest(event, '[data-model-add]')) { addModelRow(); return; }
+      if (closest(event, '[data-model-add]')) { addModelRow(); renderPreview(); return; }
       if (closest(event, '[data-desktop-add]')) { addDesktopModelRow(); return; }
+      const standard = closest(event, '[data-desktop-standard]');
+      if (standard) { fillStandardAliases(JSON.parse(standard.dataset.desktopStandard)); return; }
       const remove = closest(event, '.model-remove, .desktop-model-remove');
-      if (remove) { remove.closest('.model-row, .desktop-model-row')?.remove(); return; }
+      if (remove) {
+        remove.closest('.model-row, .desktop-model-row')?.remove();
+        renderPreview();
+        return;
+      }
       const target = closest(event, '[data-action]');
       if (target) send(target);
+    });
+    // The preview tracks the form as it is typed, so the effect of a role or a
+    // 1M tick is visible without a round trip to the host.
+    document.addEventListener('input', (event) => {
+      if (closest(event, '.model-form')) renderPreview();
+    });
+    document.addEventListener('change', (event) => {
+      if (closest(event, '.model-form')) renderPreview();
     });
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape') document.querySelectorAll('details.overflow[open]').forEach((open) => { open.open = false; });
@@ -537,6 +633,9 @@ export class ProviderManagerPanel {
       document.getElementById('header-status').innerHTML = payload.status;
       document.getElementById('list-pane').innerHTML = payload.list;
       document.getElementById('detail-pane').innerHTML = payload.detail;
+      // The model form is server-rendered, so its preview has to be filled in
+      // after every swap rather than only on input.
+      renderPreview();
       const firstField = document.getElementById('edit-name');
       if (firstField) firstField.focus();
     });
@@ -764,15 +863,31 @@ const MODEL_ROLE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "subagent", label: "子代理" }
 ];
 
-const MODEL_EFFORT_OPTIONS = ["auto", "low", "medium", "high", "xhigh", "max"];
+/**
+ * The first option is the empty one on purpose. `auto` is a value Claude Code
+ * accepts and this extension does write, so it cannot double as "leave it
+ * alone" — without a distinct empty choice, merely opening this editor on a
+ * provider the wizard left unset and pressing 保存 silently added
+ * `CLAUDE_CODE_EFFORT_LEVEL=auto` to all three configs.
+ */
+const MODEL_EFFORT_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "", label: "不设置（不写入该变量）" },
+  { value: "auto", label: "auto" },
+  { value: "low", label: "low" },
+  { value: "medium", label: "medium" },
+  { value: "high", label: "high" },
+  { value: "xhigh", label: "xhigh" },
+  { value: "max", label: "max" }
+];
 
 /**
  * The per-provider model editor: the cached model list, editable row by row,
- * each with the mapping role it plays; the main model carries the 1M switch
- * (the CLI runs it as `model[1m]`), and every Claude Desktop alias has its own
- * 1M switch, since aliases resolve to different models with different context
- * windows. A rejected draft wins over the stored values so nothing typed is
- * lost on a validation error.
+ * each with the mapping role it plays and its own 1M switch. The switch is per
+ * model, not per role — a model routinely fills several roles, so a declaration
+ * attached to a role would apply to only some of the places it is sent. Every
+ * Claude Desktop alias has its own switch too, since aliases resolve to
+ * different models with different context windows. A rejected draft wins over
+ * the stored values so nothing typed is lost on a validation error.
  */
 function providerModelForm(
   provider: ProviderManagerState["claudeProviders"][number],
@@ -788,7 +903,7 @@ function providerModelForm(
     ? `<div class="form-notice" role="alert"><span>⚠</span><span>${escapeHtml(edit.notice)}</span></div>`
     : "";
   const effortOptions = (selected: string): string => MODEL_EFFORT_OPTIONS.map((option) =>
-    `<option value="${option}"${option === selected ? " selected" : ""}>${option}</option>`
+    `<option value="${option.value}"${option.value === selected ? " selected" : ""}>${escapeHtml(option.label)}</option>`
   ).join("");
   const rows = form.models.length
     ? form.models.map((row) => modelRow(row.name, row.role, row.supports1m)).join("")
@@ -797,22 +912,35 @@ function providerModelForm(
     ? form.desktopModels.map((entry) => desktopModelRow(entry.name, entry.supports1m)).join("")
     : "";
   return `<article class="card model-form">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>模型与参数 — ${escapeHtml(provider.name)}</h2><small class="url">角色映射决定 Claude 各模型族与子代理使用哪个模型；1M 与 effort 会写入 VS Code、终端 CLI 与 Desktop 三端配置。</small></div></div>${notice}
-<div class="detail-section model-section"><div><h3>模型列表与角色</h3><p>模型 ID 将原样发送给网关。每个模型可扮演一个角色；同一角色重复时以第一个为准。每个角色可独立声明 1M 上下文（CLI 以模型名 [1m] 后缀使用）。</p></div></div>
+<div class="detail-section model-section"><div><h3>模型列表与角色</h3><p>模型 ID 将原样发送给网关。必须有一个模型担任「主模型」，未指派的角色会回落到它。同一角色重复时以第一个为准。1M 按模型声明：勾选后该模型在它承担的每个角色上都以 [1m] 后缀发送，未指派角色的模型也能保留勾选。</p></div></div>
 <div class="model-rows" id="model-rows">${rows}</div>
-<button class="ghost" type="button" data-model-add>＋ 添加模型</button>
+<div class="row-tools"><button class="ghost" type="button" data-model-add>＋ 添加模型</button><button class="ghost" type="button" data-action="fetchProviderModels" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">⟳ 从服务获取模型列表</button><button class="ghost" type="button" data-action="autoAssignModelRoles" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">✨ 自动分配角色</button></div>
 <template id="model-row-template">${modelRow("", "", false)}</template>
-<div class="detail-section model-section"><div><h3>Claude Desktop 模型名（可选）</h3><p>仅当网关的真实模型名不被 Desktop 接受时才需要（如 DeepSeek）。每个别名的 1M 开关独立：勾选后桌面选择器才会为它提供 1M 上下文变体。</p></div></div>
+<div class="detail-section model-section"><div><h3>保存后将写入</h3><p>下面是这份配置最终发送给 Claude Code 的模型名。未指派的角色回落到主模型，勾选 1M 的模型带 [1m] 后缀。</p></div></div>
+<div class="env-preview" id="env-preview"></div>
+<div class="detail-section model-section"><div><h3>Claude Desktop 模型名（可选）</h3><p>仅当网关的真实模型名不被 Desktop 接受时才需要（如 DeepSeek）。每个别名的 1M 开关独立：勾选后桌面选择器才会为它提供 1M 上下文变体。</p></div></div>${desktopAliasHint(provider)}
 <div class="desktop-model-rows" id="desktop-model-rows">${desktopRows}</div>
-<button class="ghost" type="button" data-desktop-add>＋ 添加桌面模型名</button>
+<div class="row-tools"><button class="ghost" type="button" data-desktop-add>＋ 添加桌面模型名</button><button class="ghost" type="button" data-desktop-standard='${escapeHtml(JSON.stringify(CLAUDE_DESKTOP_ALIAS_MODELS))}'>⚡ 填入标准 Claude 别名</button></div>
 <template id="desktop-model-row-template">${desktopModelRow("", false)}</template>
 <div class="detail-grid">
-<div class="detail-item detail-wide"><span class="detail-label">推理强度（effort）</span><select id="model-effort" class="form-select">${effortOptions(form.effort)}</select><small class="field-hint">写入 CLAUDE_CODE_EFFORT_LEVEL。auto 由 Claude 自己决定。</small></div>
+<div class="detail-item detail-wide"><span class="detail-label">推理强度（effort）</span><select id="model-effort" class="form-select">${effortOptions(form.effort)}</select><small class="field-hint">写入 CLAUDE_CODE_EFFORT_LEVEL。选「不设置」则完全不写这个变量，交给 Claude Code 自己的默认；auto 也是一个会被写入的取值。</small></div>
 </div>
 <div class="detail-section"><div><h3>保存</h3><p>${provider.active ? "该服务正在使用，保存后重新应用即生效。" : "保存后切换到此服务时即生效。"}</p></div>${actionBar(
   [{ label: "保存", action: "saveProviderModels", primary: true }, { label: "取消", action: "cancelProviderModelEdit" }],
   [],
   target
 )}</div></article>`;
+}
+
+/**
+ * Explains at configuration time — rather than after a failed desktop switch —
+ * that this gateway can only be reached through Anthropic-style aliases.
+ */
+function desktopAliasHint(
+  provider: ProviderManagerState["claudeProviders"][number]
+): string {
+  if (!provider.desktopAliasRequired) return "";
+  return `<div class="form-notice" role="note"><span>ℹ</span><span>该服务的模型名不是 Anthropic 系名称，Claude Desktop 会拒绝整份配置。要在桌面应用里使用它，必须在这里填写别名——点“填入标准 Claude 别名”即可，网关会把这些名字映射到自己的模型。</span></div>`;
 }
 
 /** One editable model row: name input, role select, 1M switch, remove button. */

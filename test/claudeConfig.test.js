@@ -18,7 +18,9 @@ const {
   normalizeClaudePermissionStrategy,
   normalizeClaudeProviderBaseUrl,
   normalizeClaudeProviderUrl,
-  stripClaudeProviderSettingsJson
+  parseClaudeJsonObject,
+  stripClaudeProviderSettingsJson,
+  suggestClaudeModelRoles
 } = require("../out/claudeConfig.js");
 
 const providers = [
@@ -181,6 +183,114 @@ test("only adds the 1m suffix when the provider mapping declares support", () =>
   assert.equal(longContext.find((entry) => entry.name === "ANTHROPIC_DEFAULT_HAIKU_MODEL")?.value, "fast-model");
 });
 
+test("role suggestion splits a provider's models into the strong and the fast one", () => {
+  const roleOf = (rows, name) => rows.find((row) => row.name === name)?.role;
+  const deepSeek = suggestClaudeModelRoles(["deepseek-v4-pro", "deepseek-v4-flash"]);
+  assert.equal(roleOf(deepSeek, "deepseek-v4-pro"), "main");
+  assert.equal(roleOf(deepSeek, "deepseek-v4-flash"), "haiku");
+  // Order of the input must not decide the outcome.
+  const reversed = suggestClaudeModelRoles(["deepseek-v4-flash", "deepseek-v4-pro"]);
+  assert.equal(roleOf(reversed, "deepseek-v4-pro"), "main");
+  assert.equal(roleOf(reversed, "deepseek-v4-flash"), "haiku");
+  // The middle model stays unassigned and falls back to the main model.
+  const three = suggestClaudeModelRoles(["glm-4-plus", "glm-4-air", "glm-4"]);
+  assert.equal(roleOf(three, "glm-4-plus"), "main");
+  assert.equal(roleOf(three, "glm-4-air"), "haiku");
+  assert.equal(roleOf(three, "glm-4"), "");
+});
+
+test("role suggestion reads `chat` as the ordinary model, not the strong one", () => {
+  const roleOf = (rows, name) => rows.find((row) => row.name === name)?.role;
+  // DeepSeek's own pair on the Anthropic-compatible endpoint. Treating `chat` as a
+  // strength marker put the cheap model in the main role and the reasoner in haiku.
+  const deepSeek = suggestClaudeModelRoles(["deepseek-chat", "deepseek-reasoner"]);
+  assert.equal(roleOf(deepSeek, "deepseek-reasoner"), "main");
+  assert.equal(roleOf(deepSeek, "deepseek-chat"), "haiku");
+  const reversed = suggestClaudeModelRoles(["deepseek-reasoner", "deepseek-chat"]);
+  assert.equal(roleOf(reversed, "deepseek-reasoner"), "main");
+  assert.equal(roleOf(reversed, "deepseek-chat"), "haiku");
+});
+
+test("role suggestion still names a main model when nothing looks fast or strong", () => {
+  const single = suggestClaudeModelRoles(["some-model"]);
+  assert.deepEqual(single, [{ name: "some-model", role: "main" }]);
+  // With no hints at all the provider's own order decides, first is flagship.
+  const flat = suggestClaudeModelRoles(["model-a", "model-b"]);
+  assert.equal(flat[0].role, "main");
+  assert.equal(flat[1].role, "haiku");
+  assert.deepEqual(suggestClaudeModelRoles([]), []);
+  assert.deepEqual(suggestClaudeModelRoles(["  ", ""]), []);
+});
+
+test("a suggested mapping resolves every role once normalized", () => {
+  const rows = suggestClaudeModelRoles(["qwen3-max", "qwen3-turbo"]);
+  const pick = (role) => rows.find((row) => row.role === role)?.name;
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: pick("main"),
+    haikuModel: pick("haiku")
+  });
+  assert.equal(mapping.mainModel, "qwen3-max");
+  assert.equal(mapping.opusModel, "qwen3-max");
+  assert.equal(mapping.sonnetModel, "qwen3-max");
+  assert.equal(mapping.haikuModel, "qwen3-turbo");
+  assert.equal(mapping.subagentModel, "qwen3-turbo");
+});
+
+test("a model declared 1M is suffixed in every role it fills, including the fallbacks", () => {
+  // Only `main` and `haiku` are assigned; opus/sonnet/fable fall back to the
+  // main model, and the declaration has to follow the model into them.
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: "pro",
+    haikuModel: "fast",
+    longContextModels: ["pro"]
+  });
+  const environment = createClaudeModelEnvironment(mapping);
+  const valueOf = (name) => environment.find((entry) => entry.name === name)?.value;
+  assert.equal(valueOf("ANTHROPIC_MODEL"), "pro[1m]");
+  assert.equal(valueOf("ANTHROPIC_DEFAULT_OPUS_MODEL"), "pro[1m]");
+  assert.equal(valueOf("ANTHROPIC_DEFAULT_SONNET_MODEL"), "pro[1m]");
+  assert.equal(valueOf("ANTHROPIC_DEFAULT_FABLE_MODEL"), "pro[1m]");
+  assert.equal(valueOf("ANTHROPIC_CUSTOM_MODEL_OPTION"), "pro[1m]");
+  // The fast model was not declared, so it keeps its own window.
+  assert.equal(valueOf("ANTHROPIC_DEFAULT_HAIKU_MODEL"), "fast");
+  assert.equal(valueOf("CLAUDE_CODE_SUBAGENT_MODEL"), "fast");
+});
+
+test("a 1M declaration on a model that fills no role survives a round trip", () => {
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: "pro",
+    haikuModel: "fast",
+    longContextModels: ["pro", "spare"]
+  });
+  assert.deepEqual(mapping.longContextModels, ["pro", "spare"]);
+  // Re-normalizing its own output is stable — the editor reads back what it wrote.
+  assert.deepEqual(normalizeClaudeModelMapping(mapping).longContextModels, ["pro", "spare"]);
+  // An unmapped model names no role, so the derived legacy field skips it.
+  assert.equal(mapping.longContextRoles.includes("main"), true);
+  assert.equal(mapping.longContextRoles.length, 4);
+});
+
+test("a stored per-role declaration is read as the models those roles point at", () => {
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: "pro",
+    haikuModel: "fast",
+    longContextRoles: ["haiku", "subagent"]
+  });
+  assert.deepEqual(mapping.longContextModels, ["fast"]);
+  assert.equal(mapping.supports1m, false);
+});
+
+test("longContextModels wins over a stale stored longContextRoles", () => {
+  const mapping = normalizeClaudeModelMapping({
+    mainModel: "pro",
+    haikuModel: "fast",
+    longContextRoles: ["haiku"],
+    longContextModels: ["pro"]
+  });
+  assert.deepEqual(mapping.longContextModels, ["pro"]);
+  assert.equal(mapping.longContextRoles.includes("haiku"), false);
+});
+
 test("each role can declare 1M on its own", () => {
   const mapping = normalizeClaudeModelMapping({
     mainModel: "pro",
@@ -196,7 +306,11 @@ test("each role can declare 1M on its own", () => {
 
 test("stored legacy supports1m maps onto the roles the old code suffixed", () => {
   const mapping = normalizeClaudeModelMapping({ mainModel: "m", haikuModel: "h", supports1m: true });
-  assert.deepEqual(mapping.longContextRoles, ["main", "fable", "opus", "sonnet"]);
+  // The roles are derived from the declared models and only read with
+  // `includes`, so the set is the guarantee — not the order it comes out in.
+  assert.deepEqual([...mapping.longContextRoles].sort(), ["fable", "main", "opus", "sonnet"]);
+  assert.deepEqual(mapping.longContextModels, ["m"]);
+  assert.equal(mapping.supports1m, true);
 });
 
 test("normalizes stored model mappings and the DeepSeek official template", () => {
@@ -310,4 +424,39 @@ test("merge keeps env absent when nothing is wanted and rejects broken documents
     () => mergeClaudeJsonEnv("[1,2,3]", new Set(["ANTHROPIC_BASE_URL"]), []),
     /根节点/
   );
+});
+
+test("a BOM or an empty body reads as a document, not as corruption", () => {
+  // Notepad and PowerShell's `Set-Content`/`>` both prefix a BOM, and a crashed or
+  // interrupted writer leaves an empty file — neither is a reason to refuse the
+  // write that would repair the file.
+  assert.deepEqual(parseClaudeJsonObject("﻿{\"a\":1}", "x"), { a: 1 });
+  assert.deepEqual(parseClaudeJsonObject("", "x"), {});
+  assert.deepEqual(parseClaudeJsonObject("   \n", "x"), {});
+  assert.throws(() => parseClaudeJsonObject("﻿not json", "x"), /JSON/);
+  assert.throws(() => parseClaudeJsonObject("﻿[1]", "x"), /根节点/);
+
+  const merged = mergeClaudeJsonEnv(
+    "﻿{\n  \"env\": { \"KEEP\": \"yes\" }\n}\n",
+    new Set(["ANTHROPIC_BASE_URL"]),
+    [{ name: "ANTHROPIC_BASE_URL", value: "https://new.example.com" }]
+  );
+  assert.equal(merged.changed, true);
+  // The rewritten document no longer carries the BOM, so the next reader is safe too.
+  assert.equal(merged.content.startsWith("{"), true);
+  assert.equal(JSON.parse(merged.content).env.KEEP, "yes");
+
+  const fromEmpty = mergeClaudeJsonEnv(
+    "",
+    new Set(["ANTHROPIC_BASE_URL"]),
+    [{ name: "ANTHROPIC_BASE_URL", value: "https://new.example.com" }]
+  );
+  assert.equal(JSON.parse(fromEmpty.content).env.ANTHROPIC_BASE_URL, "https://new.example.com");
+
+  const stripped = stripClaudeProviderSettingsJson(
+    "﻿" + JSON.stringify({ env: { ANTHROPIC_BASE_URL: "https://old", KEEP: "1" } })
+  );
+  assert.deepEqual(JSON.parse(stripped.content).env, { KEEP: "1" });
+  // An empty file has nothing to strip and must not be reported as broken.
+  assert.deepEqual(stripClaudeProviderSettingsJson(""), { content: "", removed: [] });
 });

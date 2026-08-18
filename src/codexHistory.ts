@@ -21,9 +21,10 @@
  * backend that produced it.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import initSqlJs = require("sql.js");
-import { parseTopLevelTomlString } from "./codexConfig";
+import { parseTomlTableKeyPath } from "./codexConfig";
 
 export const CODEX_OFFICIAL_PROVIDER_ID = "openai";
 export const CODEX_UNIFIED_PROVIDER_ID = "custom";
@@ -143,6 +144,14 @@ function backupStateDbFileSync(
   driver.snapshot(dest);
 }
 
+/**
+ * Renaming over a file another process holds open fails in opposite ways per platform:
+ * Windows refuses with a sharing violation, while POSIX succeeds and orphans the
+ * writer's descriptor. The callers guard the POSIX side by verifying the file is
+ * unchanged around the read/backup (and, for the state DB, by waiting out the WAL);
+ * what was missing was making the Windows refusal legible instead of a bare errno.
+ * The rename itself stays atomic so a crash mid-write can never truncate the original.
+ */
 function atomicWriteFileSync(filePath: string, data: string | Buffer): void {
   const temp = `${filePath}.ai-provider-switcher-${process.pid}-${Date.now()}.tmp`;
   fs.writeFileSync(temp, data);
@@ -153,6 +162,15 @@ function atomicWriteFileSync(filePath: string, data: string | Buffer): void {
       fs.unlinkSync(temp);
     } catch {
       // Best effort cleanup.
+    }
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+      // Windows reports a sharing violation as a bare errno, which reads as a
+      // permissions problem the user cannot act on.
+      throw new Error(
+        `无法写入 ${path.basename(filePath)}：文件正被其他程序占用。` +
+          `请退出所有正在运行的 Codex（含 VS Code 内的 Codex 面板与终端里的 codex 命令）后重试。`
+      );
     }
     throw error;
   }
@@ -188,9 +206,14 @@ function backupGenerationMatchesDir(generationPath: string, codexDirKey: string)
 // config.toml helpers
 // ---------------------------------------------------------------------------
 
-/** Whether the live config routes sessions into the shared `custom` bucket. */
+/**
+ * Whether the live config routes sessions into the shared `custom` bucket.
+ * Reads with the lenient scalar parser: TOML accepts `model_provider = 'custom'`
+ * just as happily as the double-quoted form, and treating the literal-string form
+ * as "not unified" made the extension rewrite a config that was already correct.
+ */
 export function codexConfigRoutesUnified(configText: string): boolean {
-  return parseTopLevelTomlString(configText, "model_provider") === CODEX_UNIFIED_PROVIDER_ID;
+  return parseCodexTopLevelScalar(configText, "model_provider") === CODEX_UNIFIED_PROVIDER_ID;
 }
 
 /** Simple top-level scalar parser tolerating both "..." and '...' quoting. */
@@ -217,10 +240,23 @@ export function parseCodexTopLevelScalar(content: string, key: string): string |
   return undefined;
 }
 
+function keyPathStartsWith(keyPath: string[], prefix: string[]): boolean {
+  return keyPath.length >= prefix.length && prefix.every((part, index) => keyPath[index] === part);
+}
+
+/**
+ * Locate a table by its parsed key path rather than by matching the header text.
+ * `[model_providers.custom]` and `[model_providers."custom"]` are the same table
+ * to TOML — and the quoted form is exactly what this extension writes elsewhere,
+ * so a text match missed the sections users are most likely to already have.
+ */
 function findTomlSectionBounds(content: string, sectionName: string): { start: number; end: number } | undefined {
+  const target = sectionName.split(".");
   const lines = content.split(/\r?\n/);
-  const header = new RegExp(`^\\s*\\[${escapeRegExp(sectionName)}\\]\\s*$`);
-  const start = lines.findIndex((line) => header.test(line));
+  const start = lines.findIndex((line) => {
+    const keyPath = parseTomlTableKeyPath(line);
+    return keyPath !== undefined && keyPath.length === target.length && keyPathStartsWith(keyPath, target);
+  });
   if (start < 0) return undefined;
   const end = lines.findIndex((line, index) => index > start && /^\s*\[/.test(line));
   return { start, end: end >= 0 ? end : lines.length };
@@ -240,9 +276,18 @@ function readTomlSectionKeyValues(content: string, sectionName: string): Map<str
   return values;
 }
 
-/** Whether content already defines a `[model_providers.custom]` section. */
+/**
+ * Whether content already defines the `custom` provider in any form. A subtable such as
+ * `[model_providers.custom.auth]` defines the parent table implicitly, so it counts too —
+ * appending another `[model_providers.custom]` alongside one is a duplicate-table error
+ * that stops Codex from starting.
+ */
 export function hasCodexCustomProviderSection(content: string): boolean {
-  return findTomlSectionBounds(content, "model_providers.custom") !== undefined;
+  const target = ["model_providers", "custom"];
+  return content.split(/\r?\n/).some((line) => {
+    const keyPath = parseTomlTableKeyPath(line);
+    return keyPath !== undefined && keyPathStartsWith(keyPath, target);
+  });
 }
 
 /** Whether the existing custom section is exactly the injected official shape. */
@@ -302,7 +347,16 @@ export function getCodexStateDbCandidates(codexDir: string, configText: string):
     process.env.CODEX_SQLITE_HOME ||
     ""
   ).trim();
-  if (sqliteHome) dirs.push(path.resolve(sqliteHome));
+  // `~/codex-state` is the form people actually write, and a relative path means
+  // "relative to the Codex home" — resolving it against the extension host's cwd
+  // pointed at whatever directory VS Code happened to be launched from.
+  if (sqliteHome) {
+    const home = os.homedir();
+    const expanded = sqliteHome === "~" || sqliteHome.startsWith("~/") || sqliteHome.startsWith("~\\")
+      ? path.join(home, sqliteHome.slice(1))
+      : sqliteHome;
+    dirs.push(path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(codexDir, expanded));
+  }
 
   const result: string[] = [];
   const seen = new Set<string>();
@@ -557,7 +611,13 @@ function tryOpenNativeStateDb(dbPath: string, readOnly: boolean): StateDbDriver 
   }
 }
 
-function waitForWalSidecar(dbPath: string, walWaitMs: number): void {
+/**
+ * Poll until Codex has checkpointed its WAL. This must not block the thread: the
+ * extension host is single-threaded, so a synchronous wait froze the entire VS Code
+ * UI — including the progress notification meant to show that work was underway —
+ * for as long as Codex kept the sidecar open.
+ */
+async function waitForWalSidecar(dbPath: string, walWaitMs: number): Promise<void> {
   const walPath = `${dbPath}-wal`;
   const deadline = Date.now() + walWaitMs;
   for (;;) {
@@ -576,12 +636,12 @@ function waitForWalSidecar(dbPath: string, walWaitMs: number): void {
       );
     }
     const remaining = Math.min(400, Math.max(0, deadline - Date.now()));
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, remaining);
+    await new Promise<void>((resolve) => setTimeout(resolve, remaining));
   }
 }
 
 async function tryOpenSqlJsStateDb(dbPath: string, walWaitMs: number): Promise<StateDbDriver | undefined> {
-  waitForWalSidecar(dbPath, walWaitMs);
+  await waitForWalSidecar(dbPath, walWaitMs);
   const SQL = await getSqlJs();
   const data = fs.readFileSync(dbPath);
   const stat = fs.statSync(dbPath);

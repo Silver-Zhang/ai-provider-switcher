@@ -681,3 +681,59 @@ test("backup generations from another codex dir are ignored by the probe", () =>
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a quoted or spaced custom section is still detected as already present", () => {
+  // The extension writes provider headers in the quoted form, so that is the form
+  // users copy. Missing it appended a second [model_providers.custom] table, which
+  // is a duplicate-table parse error that stops Codex from starting at all.
+  assert.equal(hasCodexCustomProviderSection('[model_providers."custom"]\nname = "Relay"\n'), true);
+  assert.equal(hasCodexCustomProviderSection("[model_providers.'custom']\nname = \"Relay\"\n"), true);
+  assert.equal(hasCodexCustomProviderSection("[ model_providers . custom ]\nname = \"Relay\"\n"), true);
+  // A subtable defines the parent implicitly, so it counts too.
+  assert.equal(hasCodexCustomProviderSection('[model_providers.custom.auth]\ncommand = "x"\n'), true);
+  // Neighbouring providers must not be mistaken for it.
+  assert.equal(hasCodexCustomProviderSection('[model_providers.custom-relay]\nname = "x"\n'), false);
+  assert.equal(hasCodexCustomProviderSection('[model_providers.other]\nname = "x"\n'), false);
+});
+
+test("the official-shape check reads quoted headers too", () => {
+  const body = serializeCodexUnifiedOfficialBlock().split("\n").slice(1).join("\n");
+  assert.equal(codexCustomSectionMatchesUnifiedOfficial(`[model_providers."custom"]\n${body}\n`), true);
+});
+
+test("single-quoted routing keys count as routed to the shared bucket", () => {
+  // TOML literal strings are valid here, and treating them as "not routed" made the
+  // extension rewrite a config that was already correct.
+  assert.equal(codexConfigRoutesUnified("model_provider = 'custom'\n"), true);
+  assert.equal(codexConfigRoutesUnified("model_provider = 'openai'\n"), false);
+});
+
+test("sqlite_home accepts ~ and resolves relative paths against the Codex home", () => {
+  const dir = makeTempDir();
+  try {
+    const codexDir = path.join(dir, ".codex");
+    const nested = path.join(codexDir, "state-dir");
+    fs.mkdirSync(nested, { recursive: true });
+    fs.writeFileSync(path.join(nested, "state.db"), "x");
+
+    // Relative to the Codex home, not to whatever directory VS Code was launched from.
+    const relative = getCodexStateDbCandidates(codexDir, `sqlite_home = "state-dir"`);
+    assert.ok(relative.includes(path.join(nested, "state.db")), "relative sqlite_home should resolve under codexDir");
+
+    // "~/..." is what people actually write in config.toml; it is not shell-expanded there.
+    const homeDir = path.join(os.homedir(), ".ai-provider-switcher-sqlite-home-test");
+    fs.mkdirSync(homeDir, { recursive: true });
+    try {
+      fs.writeFileSync(path.join(homeDir, "state.db"), "x");
+      const expanded = getCodexStateDbCandidates(
+        codexDir,
+        `sqlite_home = "~/.ai-provider-switcher-sqlite-home-test"`
+      );
+      assert.ok(expanded.includes(path.join(homeDir, "state.db")), "~ should expand to the home directory");
+    } finally {
+      fs.rmSync(homeDir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

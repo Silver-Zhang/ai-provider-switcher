@@ -16,10 +16,21 @@ export type ClaudeModelMapping = {
   sonnetModel: string;
   haikuModel: string;
   subagentModel: string;
-  /** Legacy switch: declared 1M support. Kept for stored data; prefer `longContextRoles`. */
+  /** Legacy switch: declared 1M support. Kept for stored data; prefer `longContextModels`. */
   supports1m?: boolean;
-  /** Which roles run as the `[1m]` variant — each role is independently switchable. */
+  /**
+   * Legacy per-role declaration, superseded by `longContextModels`. Still read
+   * from stored data and still emitted (derived) so an older build downgrades
+   * cleanly, but a role never carries 1M on its own any more — the model does.
+   */
   longContextRoles?: ClaudeModelRole[];
+  /**
+   * Authoritative: the model IDs that run as the `[1m]` variant. Keyed by model
+   * rather than by role because one model routinely plays several roles (an
+   * unassigned role falls back to the main model), and a declaration attached to
+   * a role would then apply to only one of the places that model is sent.
+   */
+  longContextModels?: string[];
   effortLevel?: "low" | "medium" | "high" | "xhigh" | "max" | "auto";
 };
 
@@ -115,9 +126,67 @@ export function createClaudeModelMapping(
     haikuModel: fastModel.trim(),
     subagentModel: fastModel.trim(),
     supports1m,
-    longContextRoles: supports1m ? ["main", "fable", "opus", "sonnet"] : [],
+    longContextRoles: supports1m ? [...LEGACY_LONG_CONTEXT_ROLES] : [],
+    // The gateway-wide switch only ever covered the main model; the fast model
+    // keeps its own window unless it is the same ID.
+    longContextModels: supports1m ? [mainModel.trim()] : [],
     effortLevel
   };
+}
+
+/** The roles the pre-0.5.1 gateway-wide `supports1m` switch used to suffix. */
+const LEGACY_LONG_CONTEXT_ROLES: ClaudeModelRole[] = ["main", "fable", "opus", "sonnet"];
+
+/** Name fragments that mark a model as the cheap/fast one in its family. */
+const FAST_MODEL_HINTS = [
+  "flash", "mini", "lite", "fast", "haiku", "air", "small", "nano", "tiny", "turbo", "instant", "speed"
+];
+/**
+ * Name fragments that mark a model as the capable/expensive one.
+ *
+ * `chat` is deliberately absent: it names the ordinary chat model, not the
+ * strong one, and reading it as strength inverted the single most common pair
+ * on Anthropic-compatible relays — `deepseek-chat` outranked `deepseek-reasoner`
+ * and the cheap model was assigned the main role.
+ */
+const STRONG_MODEL_HINTS = [
+  "pro", "max", "opus", "ultra", "plus", "large", "thinking", "reasoner", "advanced", "sonnet"
+];
+
+/**
+ * Guesses which model should play which role, so the editor can fill the six
+ * mapping roles in one click instead of asking the user to understand them.
+ * Purely name-based: the strongest-looking model takes the reasoning roles and
+ * the fastest-looking one takes the background roles, which is the split every
+ * Anthropic-compatible relay is built around. The result is a starting point —
+ * the form stays editable — so a wrong guess costs a correction, not a failure.
+ */
+export function suggestClaudeModelRoles(
+  models: string[]
+): Array<{ name: string; role: ClaudeModelRole | "" }> {
+  const usable = models.map((name) => name.trim()).filter((name) => name !== "");
+  if (usable.length === 0) return [];
+  // Positive means it reads as the fast model, negative as the capable one.
+  const speed = (name: string): number => {
+    const model = name.toLowerCase();
+    const fast = FAST_MODEL_HINTS.some((hint) => model.includes(hint)) ? 1 : 0;
+    const strong = STRONG_MODEL_HINTS.some((hint) => model.includes(hint)) ? 1 : 0;
+    return fast - strong;
+  };
+  // A stable sort keeps the provider's own ordering as the tie-breaker, which
+  // is usually flagship-first.
+  const ranked = [...usable].sort((left, right) => speed(left) - speed(right));
+  const strongest = ranked[0];
+  const fastest = ranked[ranked.length - 1];
+  const roleFor = (name: string): ClaudeModelRole | "" => {
+    if (name === strongest) return "main";
+    if (name === fastest) return "haiku";
+    return "";
+  };
+  // Naming `main` and `haiku` is the whole mapping: `opus`, `sonnet` and
+  // `fable` fall back to the main model and `subagent` to the haiku one, so the
+  // editor stays readable instead of showing six rows saying the same thing.
+  return usable.map((name) => ({ name, role: roleFor(name) }));
 }
 
 export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping | undefined {
@@ -128,25 +197,44 @@ export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping 
   const haikuModel = stringValue(value.haikuModel) || mainModel;
   const subagentModel = stringValue(value.subagentModel) || haikuModel;
   if (!mainModel || !opusModel || !sonnetModel || !haikuModel || !subagentModel) return undefined;
+  const fableModel = stringValue(value.fableModel) || mainModel;
   const effort = stringValue(value.effortLevel);
   const effortLevel = ["low", "medium", "high", "xhigh", "max", "auto"].includes(effort)
     ? effort as ClaudeModelMapping["effortLevel"]
     : undefined;
-  // `longContextRoles` is authoritative; stored legacy `supports1m` maps onto
-  // the roles the old code used to suffix so nothing changes for old data.
+  const modelForRole: Record<ClaudeModelRole, string> = {
+    main: mainModel,
+    fable: fableModel,
+    opus: opusModel,
+    sonnet: sonnetModel,
+    haiku: haikuModel,
+    subagent: subagentModel
+  };
+  // `longContextModels` is authoritative. Older data declared 1M per role, and
+  // older data still declared it gateway-wide; both are read by resolving the
+  // roles they named to the models those roles point at, so a stored mapping
+  // keeps suffixing exactly what it suffixed before.
+  const rawModels = Array.isArray(value.longContextModels) ? value.longContextModels : undefined;
   const rawRoles = Array.isArray(value.longContextRoles) ? value.longContextRoles : undefined;
-  const longContextRoles: ClaudeModelRole[] = rawRoles
-    ? CLAUDE_MODEL_ROLES.filter((role) => (rawRoles as unknown[]).includes(role))
-    : value.supports1m === true ? ["main", "fable", "opus", "sonnet"] : [];
+  const declared = rawModels
+    ? (rawModels as unknown[]).map((entry) => stringValue(entry)).filter((name) => name !== "")
+    : (rawRoles
+      ? CLAUDE_MODEL_ROLES.filter((role) => (rawRoles as unknown[]).includes(role))
+      : value.supports1m === true ? LEGACY_LONG_CONTEXT_ROLES : []
+    ).map((role) => modelForRole[role]);
+  const longContext = new Set(declared.filter((name) => name !== ""));
   return {
     mainModel,
-    fableModel: stringValue(value.fableModel) || mainModel,
+    fableModel,
     opusModel,
     sonnetModel,
     haikuModel,
     subagentModel,
-    supports1m: value.supports1m === true,
-    longContextRoles,
+    // Both legacy shapes are re-derived from the models so a downgrade to a
+    // build that reads them still sees the same declaration.
+    supports1m: longContext.has(mainModel),
+    longContextRoles: CLAUDE_MODEL_ROLES.filter((role) => longContext.has(modelForRole[role])),
+    longContextModels: [...longContext],
     effortLevel
   };
 }
@@ -154,17 +242,19 @@ export function normalizeClaudeModelMapping(value: unknown): ClaudeModelMapping 
 export function createClaudeModelEnvironment(mapping: ClaudeModelMapping): ClaudeEnvVar[] {
   const normalized = normalizeClaudeModelMapping(mapping);
   if (!normalized) return [];
-  const oneM = (role: ClaudeModelRole): boolean => (normalized.longContextRoles ?? []).includes(role);
-  const longContext = (model: string, role: ClaudeModelRole): string =>
-    oneM(role) && !model.endsWith("[1m]") ? `${model}[1m]` : model;
+  // Keyed by model, so a model declared 1M carries the suffix everywhere it is
+  // sent — including the roles it only fills by falling back to the main model.
+  const oneM = new Set(normalized.longContextModels ?? []);
+  const longContext = (model: string): string =>
+    oneM.has(model) && !model.endsWith("[1m]") ? `${model}[1m]` : model;
   const entries: ClaudeEnvVar[] = [
-    { name: "ANTHROPIC_MODEL", value: longContext(normalized.mainModel, "main") },
-    { name: "ANTHROPIC_DEFAULT_FABLE_MODEL", value: longContext(normalized.fableModel ?? normalized.mainModel, "fable") },
-    { name: "ANTHROPIC_DEFAULT_OPUS_MODEL", value: longContext(normalized.opusModel, "opus") },
-    { name: "ANTHROPIC_DEFAULT_SONNET_MODEL", value: longContext(normalized.sonnetModel, "sonnet") },
-    { name: "ANTHROPIC_DEFAULT_HAIKU_MODEL", value: longContext(normalized.haikuModel, "haiku") },
-    { name: "CLAUDE_CODE_SUBAGENT_MODEL", value: longContext(normalized.subagentModel, "subagent") },
-    { name: "ANTHROPIC_CUSTOM_MODEL_OPTION", value: longContext(normalized.mainModel, "main") },
+    { name: "ANTHROPIC_MODEL", value: longContext(normalized.mainModel) },
+    { name: "ANTHROPIC_DEFAULT_FABLE_MODEL", value: longContext(normalized.fableModel ?? normalized.mainModel) },
+    { name: "ANTHROPIC_DEFAULT_OPUS_MODEL", value: longContext(normalized.opusModel) },
+    { name: "ANTHROPIC_DEFAULT_SONNET_MODEL", value: longContext(normalized.sonnetModel) },
+    { name: "ANTHROPIC_DEFAULT_HAIKU_MODEL", value: longContext(normalized.haikuModel) },
+    { name: "CLAUDE_CODE_SUBAGENT_MODEL", value: longContext(normalized.subagentModel) },
+    { name: "ANTHROPIC_CUSTOM_MODEL_OPTION", value: longContext(normalized.mainModel) },
     { name: "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", value: normalized.mainModel },
     { name: "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", value: "Custom model mapped by AI Provider Switcher" },
     { name: "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", value: normalized.fableModel ?? normalized.mainModel },
@@ -207,7 +297,11 @@ export function stripClaudeProviderSettingsJson(content: string): {
   content: string;
   removed: string[];
 } {
-  const parsed = JSON.parse(content) as unknown;
+  // Same two benign shapes as `parseClaudeJsonObject`: a Windows-written BOM must
+  // not read as corruption, and an empty file simply has nothing to strip.
+  const text = content.replace(/^\uFEFF/, "").trim();
+  if (text === "") return { content, removed: [] };
+  const parsed = JSON.parse(text) as unknown;
   if (!isRecord(parsed)) return { content, removed: [] };
   const removed: string[] = [];
   if (isRecord(parsed.env)) {
@@ -426,6 +520,7 @@ export function getDeepSeekClaudeModelMapping(): ClaudeModelMapping {
     supports1m: true,
     // DeepSeek V4 serves a 1M window on both the pro and the flash model.
     longContextRoles: ["main", "opus", "sonnet", "haiku", "fable", "subagent"],
+    longContextModels: ["deepseek-v4-pro", "deepseek-v4-flash"],
     effortLevel: "max"
   };
 }
@@ -465,10 +560,24 @@ function stringValue(value: unknown): string {
 
 export type ClaudeJsonEnvUpdate = { content: string; changed: boolean };
 
-function parseClaudeJsonDocument(content: string, label: string): Record<string, unknown> {
+/**
+ * Reads one of Claude's JSON configs off disk.
+ *
+ * Two shapes reach `JSON.parse` as syntax errors without the document being
+ * corrupt, and both used to abort the very write that would have repaired the
+ * file. A leading UTF-8 BOM is written by Notepad, by Windows PowerShell's
+ * `Set-Content`/`>` redirection and by several editors' "UTF-8 with signature"
+ * mode, so any config a user touched by hand on Windows can carry one. A
+ * zero-length (or whitespace-only) body is what a `touch`, a crashed writer or
+ * an interrupted copy leaves behind, and it carries no configuration to lose —
+ * so it is treated as the empty document rather than as a parse failure.
+ */
+export function parseClaudeJsonObject(content: string, label: string): Record<string, unknown> {
+  const text = content.replace(/^\uFEFF/, "").trim();
+  if (text === "") return {};
   let parsed: unknown;
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(text);
   } catch {
     throw new Error(`${label} 不是有效的 JSON，无法安全写入。`);
   }
@@ -476,6 +585,10 @@ function parseClaudeJsonDocument(content: string, label: string): Record<string,
     throw new Error(`${label} 的根节点不是对象，无法安全写入。`);
   }
   return parsed;
+}
+
+function parseClaudeJsonDocument(content: string, label: string): Record<string, unknown> {
+  return parseClaudeJsonObject(content, label);
 }
 
 /**

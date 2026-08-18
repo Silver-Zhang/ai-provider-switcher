@@ -61,7 +61,14 @@ const STATE = {
       mapping: "deepseek-chat / 快速：deepseek-chat",
       permissionStrategy: "Auto",
       hasUsageConfig: false,
-      usage: "未获取"
+      usage: "未获取",
+      modelList: [
+        { name: "deepseek-v4-pro", role: "main", supports1m: true },
+        { name: "deepseek-v4-flash", role: "haiku", supports1m: false }
+      ],
+      effortLevel: "high",
+      desktopModels: [{ name: "claude-sonnet-5", supports1m: false }],
+      desktopAliasRequired: true
     },
     {
       id: "relay-b",
@@ -71,7 +78,13 @@ const STATE = {
       mapping: "未配置",
       permissionStrategy: "Auto",
       hasUsageConfig: false,
-      usage: "未获取"
+      usage: "未获取",
+      modelList: [],
+      // "" is what a provider the wizard never configured reports — distinct from
+      // "auto", which is a value that does get written.
+      effortLevel: "",
+      desktopModels: [],
+      desktopAliasRequired: false
     }
   ],
   codexMode: "官方服务",
@@ -280,4 +293,80 @@ test("a selection that no longer resolves falls back to the overview", async () 
 test("no undefined leaks into the rendered markup", () => {
   const { status, list, detail } = open({ kind: "codex", id: "codex-relay" });
   for (const fragment of [status, list, detail]) assert.doesNotMatch(fragment, /undefined/);
+});
+
+test("the model editor renders each model with its role and 1M state", async () => {
+  onAction = async () => undefined;
+  open();
+  await receive({ action: "editProviderModels", providerKind: "claude", providerId: "relay-a" });
+  const { detail } = latest();
+  assert.match(detail, /value="deepseek-v4-pro"/);
+  // The main model's 1M box is ticked and its role is selected.
+  assert.match(detail, /<option value="main" selected>/);
+  assert.match(detail, /<input type="checkbox" checked><span>1M<\/span>/);
+  // The editor offers both the fetch and the auto-assign actions in place.
+  assert.match(detail, /data-action="fetchProviderModels"/);
+  assert.match(detail, /data-action="autoAssignModelRoles"/);
+  assert.match(detail, /data-desktop-standard=/);
+  // A gateway whose own names Desktop refuses says so at configuration time.
+  assert.match(detail, /Claude Desktop 会拒绝整份配置/);
+  assert.match(detail, /id="env-preview"/);
+});
+
+test("a host-recomputed draft replaces what the form submitted", async () => {
+  const assigned = {
+    models: [
+      { name: "deepseek-v4-pro", role: "main", supports1m: true },
+      { name: "deepseek-v4-flash", role: "haiku", supports1m: false }
+    ],
+    effort: "high",
+    desktopModels: []
+  };
+  onAction = async () => ({ keepEditing: true, modelForm: assigned, message: "已按模型名分配" });
+  open();
+  // The button only exists inside the open form, so the provider is already selected.
+  await receive({ action: "editProviderModels", providerKind: "claude", providerId: "relay-a" });
+  await receive({
+    action: "autoAssignModelRoles",
+    providerKind: "claude",
+    providerId: "relay-a",
+    // What the webview submitted had no roles at all.
+    modelForm: {
+      models: [
+        { name: "deepseek-v4-pro", role: "", supports1m: true },
+        { name: "deepseek-v4-flash", role: "", supports1m: false }
+      ],
+      effort: "high",
+      desktopModels: []
+    }
+  });
+  const { detail } = latest();
+  assert.match(detail, /<option value="main" selected>/);
+  assert.match(detail, /<option value="haiku" selected>/);
+  assert.match(detail, /已按模型名分配/);
+});
+
+test("an unset effort stays unset instead of defaulting to auto", async () => {
+  onAction = async () => undefined;
+  open();
+  await receive({ action: "editProviderModels", providerKind: "claude", providerId: "relay-b" });
+  const { detail } = latest();
+  // The empty choice is what keeps CLAUDE_CODE_EFFORT_LEVEL out of the three
+  // configs; selecting `auto` by default used to write it on the first save.
+  assert.match(detail, /<option value="" selected>不设置（不写入该变量）<\/option>/);
+  assert.doesNotMatch(detail, /<option value="auto" selected>/);
+});
+
+test("a configured effort keeps its stored value selected", async () => {
+  onAction = async () => undefined;
+  open();
+  await receive({ action: "editProviderModels", providerKind: "claude", providerId: "relay-a" });
+  assert.match(latest().detail, /<option value="high" selected>high<\/option>/);
+});
+
+test("the alias hint stays out of a gateway whose own model names are usable", async () => {
+  onAction = async () => undefined;
+  open();
+  await receive({ action: "editProviderModels", providerKind: "claude", providerId: "relay-b" });
+  assert.doesNotMatch(latest().detail, /Claude Desktop 会拒绝整份配置/);
 });

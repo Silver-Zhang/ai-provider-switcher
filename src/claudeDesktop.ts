@@ -109,7 +109,12 @@ export function isClaudeDesktopCompatibleModel(name: string): boolean {
 export type ClaudeDesktopTierHints = Partial<Record<ClaudeDesktopTier, string>> & {
   /** Becomes the first entry, which the app uses as the default model. */
   defaultModel?: string;
-  supports1m?: boolean;
+  /**
+   * A capability assertion applied to every model when a plain `true`, or a
+   * predicate consulted per name when the gateway's models have different
+   * context windows — the same contract the alias builder uses.
+   */
+  supports1m?: boolean | ((name: string) => boolean);
   /** Start the picker on the 1M variant; only meaningful with `supports1m`. */
   prefer1m?: boolean;
 };
@@ -145,12 +150,17 @@ export function buildClaudeDesktopModelEntries(
         claimed.add(tier);
       }
     }
-    if (hints.supports1m && name === hints.defaultModel?.trim()) {
-      entry.supports1m = true;
-      if (hints.prefer1m) entry.prefer1m = true;
-    }
+    // Per model, not just the default one: a gateway can serve a 1M window on
+    // several of its models, and the app reads the flag off each entry.
+    const oneM = typeof hints.supports1m === "function"
+      ? hints.supports1m(name) === true
+      : hints.supports1m === true;
+    if (oneM) entry.supports1m = true;
     return entry;
   });
+  // The first entry is the app's default, so that is the only one a preferred
+  // 1M selection can land on — and only when it advertises one.
+  if (hints.prefer1m && entries[0]?.supports1m === true) entries[0].prefer1m = true;
   return { entries, rejected };
 }
 
@@ -169,6 +179,27 @@ export const CLAUDE_DESKTOP_ALIAS_MODELS = [
   "claude-opus-5",
   "claude-haiku-5"
 ] as const;
+
+/**
+ * Decides which desktop aliases advertise 1M. An alias resolves to whatever the
+ * gateway maps it onto, so each carries its own declaration in `declared`.
+ *
+ * `declared === undefined` means the aliases have never been edited, and only
+ * then does the main model's declaration seed the default (first) alias — once
+ * the list exists, an empty one is a decision. Seeding unconditionally is what
+ * made the default alias's switch impossible to turn off: it was written out as
+ * "not declared" and read back as "declared" on the next render.
+ */
+export function resolveDesktopAlias1m(
+  aliases: readonly string[],
+  declared: readonly string[] | undefined,
+  mainModelIsLongContext: boolean
+): (name: string) => boolean {
+  const explicit = new Set(declared ?? []);
+  const seed = declared === undefined && mainModelIsLongContext;
+  const defaultAlias = aliases[0];
+  return (name) => explicit.has(name) || (seed && name === defaultAlias);
+}
 
 /** The tier an Anthropic-style ID names, e.g. `claude-opus-5` → `opus`. */
 export function inferClaudeDesktopTier(name: string): ClaudeDesktopTier | undefined {
@@ -356,10 +387,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * replacing it would drop configuration the user set up in the app itself.
  */
 function parseDocument(content: string | undefined, label: string): Record<string, unknown> {
-  if (content === undefined || content.trim() === "") return {};
+  if (content === undefined) return {};
+  // Claude Desktop's configs live in a per-user directory people do edit by hand,
+  // and on Windows that means a leading BOM — from Notepad or from PowerShell's
+  // `Set-Content`/`>` — which `JSON.parse` rejects even though the document is fine.
+  const text = content.replace(/^\uFEFF/, "").trim();
+  if (text === "") return {};
   let parsed: unknown;
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(text);
   } catch {
     throw new Error(`${label} 不是有效的 JSON，无法安全写入。`);
   }

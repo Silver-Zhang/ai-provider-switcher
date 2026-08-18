@@ -55,7 +55,7 @@ export function planProviderEdit(
   const enteredUrl = draft.baseUrl.trim();
   if (!enteredUrl) return { ok: false, message: "Base URL 不能为空。" };
   if (!/^https?:\/\//i.test(enteredUrl)) {
-    return { ok: false, message: "Base URL 必须以 http:// 或 https:// 开头。" };
+    return { ok: false, message: "Base URL 必须以 http:// 或 https:// 开头（公网中转站一般是 https://，本机自建的中转站通常是 http://127.0.0.1:端口）。" };
   }
   const baseUrl = normalizeProviderBaseUrl(kind, enteredUrl);
   if (!baseUrl) return { ok: false, message: "Base URL 无效。" };

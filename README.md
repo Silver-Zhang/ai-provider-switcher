@@ -110,7 +110,7 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 
 > ⚠️ Claude Desktop 三个平台都有官方版本（Linux 版见 <https://code.claude.com/docs/en/desktop-linux>），但目录布局在各平台的构建之间存在差异，目前只在 Windows 上实测通过。自动探测的路径为：Windows `%LOCALAPPDATA%\Claude` 与 `%APPDATA%\Claude`，macOS `~/Library/Application Support/Claude`，Linux `$XDG_CONFIG_HOME/Claude` 与 `~/.config/Claude`。若自动探测失败，可用 `aiProviderSwitcher.claudeDesktopConfigRoot` 手动指定目录。
 >
-> ⚠️ Codex 代理的**自动探测**在 Linux 上只认 GNOME（`gsettings org.gnome.system.proxy`）。KDE/Xfce 或无桌面环境下探测返回空，不会报错；此时可先导出 `HTTPS_PROXY` 环境变量，或直接手动填写代理地址——手动填写在所有平台上效果完全相同。
+> ⚠️ Codex 代理的**自动探测**在 Linux 上支持 GNOME（`gsettings org.gnome.system.proxy`）与 KDE（`~/.config/kioslaverc`）；Xfce 或无桌面环境下探测返回空，不会报错。macOS 上如果系统代理是 PAC/WPAD 自动配置脚本，探测会明确告诉你脚本地址——Codex 无法执行 PAC，需要你从代理软件里读出实际端口再手动填写。任何平台下都可以先导出 `HTTPS_PROXY` 环境变量，或直接手动填写代理地址——手动填写在所有平台上效果完全相同。
 
 ### 远程开发（Remote-SSH / WSL / 容器）
 
@@ -340,10 +340,12 @@ NO_PROXY="localhost,127.0.0.1,::1"
 | Claude 权限模式 | VS Code 全局设置及 `~/.claude/settings.json` |
 | Codex Provider 元数据、模型缓存 | VS Code 全局设置 |
 | Codex API Key | VS Code Secret Storage；Windows 另存当前用户 DPAPI 加密文件，macOS/Linux 使用权限为 `0600` 的本地 Key 文件；不写入 `config.toml` |
-| Codex Provider 配置 | `~/.codex/config.toml` 中的顶层选择和扩展标记块 |
-| Codex 模型目录 | `~/.codex/ai-provider-switcher-models.json` |
-| Codex 代理 | `~/.codex/.env` 中的扩展标记块 |
-| 统一会话历史备份 | `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/`（迁移）与 `codex-official-history-unify-restore-v1/`（还原） |
+| Codex Provider 配置 | Codex 主目录下 `config.toml` 中的顶层选择和扩展标记块 |
+| Codex 模型目录 | Codex 主目录下的 `ai-provider-switcher-models.json` |
+| Codex 代理 | Codex 主目录下 `.env` 中的扩展标记块 |
+| 统一会话历史备份 | Codex 主目录下 `ai-provider-switcher-backups/codex-official-history-unify-v1/`（迁移）与 `codex-official-history-unify-restore-v1/`（还原） |
+
+> Codex 主目录默认是 `~/.codex`（Windows 为 `%USERPROFILE%\.codex`）。若设置了 `CODEX_HOME` 环境变量，扩展会跟随它写入——因为 Codex 自己也读那里，写到默认目录会是一次没有任何报错的空操作。界面上的提示会直接显示实际使用的完整路径。
 | Provider 额度快照 | VS Code 全局设置；仅缓存余额、百分比、限流值和更新时间，不缓存 API 响应正文 |
 
 安全建议：
@@ -375,6 +377,22 @@ NO_PROXY="localhost,127.0.0.1,::1"
 ### 切换 Provider 会删除历史会话吗？
 
 不会。扩展不会删除 Claude 或 Codex 本地会话历史，但不会迁移正在进行的对话上下文。切换后应新建会话。
+
+### 自建中转站（one-api / new-api / LiteLLM）拉不到模型列表？
+
+Base URL 要按服务实际监听的协议填。这类服务在本机多数只开明文 HTTP，地址应写成 `http://127.0.0.1:3000` 这种形式，写成 `https://` 会连不上。填错时扩展会直接告诉你是域名解析失败、端口拒绝连接还是证书问题，按提示改即可。
+
+### 提示「不是有效的 JSON，无法安全写入」怎么办？
+
+先用编辑器打开提示里给出的那个文件确认内容。如果内容看起来完全正常，多半是文件开头有一个看不见的 BOM 字节（记事本保存、PowerShell 的 `Set-Content` 或 `>` 重定向都会写入）——0.5.5 起扩展会自动忽略 BOM 与空文件，升级即可。若确实是手改坏了（缺引号、多逗号），同目录下有扩展改动前留下的 `.ai-provider-switcher-<时间戳>.bak` 备份可以还原。
+
+### 切换了 Claude Desktop，应用里却没变化？
+
+桌面应用只在**冷启动**时读配置，关掉窗口不等于退出：Windows 要在右下角托盘图标上右键选「Quit / 退出」，macOS 要按 ⌘Q 或菜单栏 Claude → Quit，Linux 要确认进程已结束。全部退出后再重新打开。扩展的提示语会按你当前的系统给出对应说法。
+
+### Windows 上提示文件被占用（EPERM / EBUSY）？
+
+配置文件正被别的程序打开：先关闭 Claude Desktop、关闭正在编辑该文件的编辑器，或暂停杀毒软件的实时扫描，然后重试。扩展会自动重试几次，仍失败时会把文件路径写在提示里。
 
 ### 统一会话历史里，跨供应商继续旧会话为什么失败？
 
@@ -493,7 +511,7 @@ Run **AI Provider Switcher: Configure Provider Usage API**, then **AI Provider S
 
 > ⚠️ Claude Desktop has official builds on all three platforms (Linux: <https://code.claude.com/docs/en/desktop-linux>), but the data-directory layout differs between platform builds and has so far only been verified on Windows. Auto-detection probes: Windows `%LOCALAPPDATA%\Claude` and `%APPDATA%\Claude`, macOS `~/Library/Application Support/Claude`, Linux `$XDG_CONFIG_HOME/Claude` and `~/.config/Claude`. If detection fails, set `aiProviderSwitcher.claudeDesktopConfigRoot` manually.
 >
-> ⚠️ Codex proxy **auto-detection** on Linux only understands GNOME (`gsettings org.gnome.system.proxy`). KDE/Xfce or headless setups simply detect nothing and do not error; export `HTTPS_PROXY` first, or enter the address manually — manual entry behaves identically on every platform.
+> ⚠️ Codex proxy **auto-detection** on Linux understands GNOME (`gsettings org.gnome.system.proxy`) and KDE (`~/.config/kioslaverc`); Xfce and headless setups simply detect nothing and do not error. On macOS a PAC/WPAD auto-configuration script is reported by name — Codex cannot evaluate PAC, so read the real port out of your proxy app and enter it manually. On any platform you can export `HTTPS_PROXY` first, or enter the address manually — manual entry behaves identically everywhere.
 
 Requirements:
 
@@ -671,10 +689,12 @@ The extension owns only a marked block in `~/.codex/.env`. It checks existing un
 | Claude Desktop configuration | Entries under the app data directory's `configLibrary/` with `appliedId` in `_meta.json`; `deploymentMode` in `claude_desktop_config.json` |
 | Codex provider metadata and model cache | Global VS Code settings |
 | Codex API key | VS Code Secret Storage; additionally a current-user DPAPI file on Windows or a mode-`0600` local key file on macOS/Linux; never written to `config.toml` |
-| Codex provider configuration | Top-level selection and marked blocks in `~/.codex/config.toml` |
-| Codex model catalog | `~/.codex/ai-provider-switcher-models.json` |
-| Codex proxy | A marked block in `~/.codex/.env` |
-| Unified history backups | `~/.codex/ai-provider-switcher-backups/codex-official-history-unify-v1/` (migration) and `codex-official-history-unify-restore-v1/` (restore) |
+| Codex provider configuration | Top-level selection and marked blocks in `config.toml` under the Codex home |
+| Codex model catalog | `ai-provider-switcher-models.json` under the Codex home |
+| Codex proxy | A marked block in `.env` under the Codex home |
+| Unified history backups | `ai-provider-switcher-backups/codex-official-history-unify-v1/` (migration) and `codex-official-history-unify-restore-v1/` (restore), under the Codex home |
+
+> The Codex home defaults to `~/.codex` (`%USERPROFILE%\.codex` on Windows). When `CODEX_HOME` is set, the extension follows it — Codex reads there, so writing to the default would be a silent no-op. Every message in the UI prints the full path actually used.
 | Provider usage snapshots | Global VS Code settings; only balance, percentages, rate-limit values, and timestamps are cached, not raw API bodies |
 
 Security guidance:
@@ -706,6 +726,22 @@ Verify that the proxy process is running, its port is listening, it supports HTT
 ### Are sessions deleted when switching?
 
 No. Local session history is preserved, but an active conversation is not migrated across providers. Start a new conversation after switching.
+
+### A self-hosted relay (one-api / new-api / LiteLLM) returns no models
+
+Enter the Base URL with the scheme the service actually listens on. Locally these usually serve plain HTTP, so the address is `http://127.0.0.1:3000`, not `https://…`. When it is wrong, the extension now names the actual cause — DNS failure, refused port, or a rejected certificate — instead of a generic connection error.
+
+### "Not valid JSON, cannot write safely"
+
+Open the file named in the message. If its contents look fine, it most likely starts with an invisible BOM (written by Notepad, or by PowerShell `Set-Content` / `>` redirection) — since 0.5.5 the extension ignores a BOM and treats an empty file as empty, so upgrading is the fix. If the file really was hand-edited into invalid JSON, a `.ai-provider-switcher-<timestamp>.bak` copy from before the last change sits next to it.
+
+### Claude Desktop was switched but nothing changed
+
+The desktop app reads its config only on a cold start, and closing the window is not quitting: on Windows right-click the tray icon and choose Quit, on macOS press ⌘Q or use Claude → Quit, on Linux confirm the process has exited. The extension's own message states this for the platform you are on.
+
+### Windows reports the file is in use (EPERM / EBUSY)
+
+Another program holds the config open. Close Claude Desktop, close any editor with the file open, or pause real-time antivirus scanning, then retry. The extension retries briefly on its own and names the file if it still fails.
 
 ### Why does resuming an old session fail under unified Codex history?
 

@@ -8,6 +8,7 @@ const {
   buildClaudeDesktopAliasEntries,
   buildClaudeDesktopGatewayConfig,
   buildClaudeDesktopModelEntries,
+  resolveDesktopAlias1m,
   inferClaudeDesktopTier,
   isClaudeDesktopCompatibleModel,
   getClaudeDesktopEntryFile,
@@ -238,6 +239,69 @@ test("the mapping becomes tier hints and the main model leads the list", () => {
   assert.equal(entries.length, 3);
 });
 
+test("an alias 1M switch can be turned off once the aliases have been edited", () => {
+  const aliases = ["claude-sonnet-5", "claude-opus-5"];
+  // Never configured: the main model's declaration seeds the default alias.
+  const seeded = resolveDesktopAlias1m(aliases, undefined, true);
+  assert.equal(seeded("claude-sonnet-5"), true);
+  assert.equal(seeded("claude-opus-5"), false);
+  // Edited to empty: that is a decision, so nothing is forced back on.
+  const cleared = resolveDesktopAlias1m(aliases, [], true);
+  assert.equal(cleared("claude-sonnet-5"), false);
+  assert.equal(cleared("claude-opus-5"), false);
+  // Edited to name only the second alias: the default stays off.
+  const explicit = resolveDesktopAlias1m(aliases, ["claude-opus-5"], true);
+  assert.equal(explicit("claude-sonnet-5"), false);
+  assert.equal(explicit("claude-opus-5"), true);
+  // No main-model declaration, never configured: nothing is seeded.
+  const none = resolveDesktopAlias1m(aliases, undefined, false);
+  assert.equal(none("claude-sonnet-5"), false);
+});
+
+test("a cleared alias declaration survives the round trip into the written config", () => {
+  const { entries } = buildClaudeDesktopAliasEntries(
+    ["claude-sonnet-5", "claude-opus-5"],
+    "relay",
+    { supports1m: resolveDesktopAlias1m(["claude-sonnet-5", "claude-opus-5"], [], true), prefer1m: true }
+  );
+  assert.equal(entries.every((entry) => entry.supports1m === undefined), true);
+  // prefer1m cannot land on an entry that no longer advertises 1M.
+  assert.equal(entries[0].prefer1m, undefined);
+});
+
+test("the discovery path flags 1M per model, not only the default one", () => {
+  const { entries } = buildClaudeDesktopModelEntries(
+    ["claude-opus-4-8", "claude-sonnet-4-5", "claude-haiku-4-5"],
+    {
+      defaultModel: "claude-opus-4-8",
+      opus: "claude-opus-4-8",
+      sonnet: "claude-sonnet-4-5",
+      haiku: "claude-haiku-4-5",
+      // A gateway whose pro and mid models both serve 1M, but not the fast one.
+      supports1m: (name) => name !== "claude-haiku-4-5",
+      prefer1m: true
+    }
+  );
+  const entryFor = (name) => entries.find((entry) => entry.name === name);
+  assert.equal(entryFor("claude-opus-4-8").supports1m, true);
+  assert.equal(entryFor("claude-sonnet-4-5").supports1m, true);
+  assert.equal(entryFor("claude-haiku-4-5").supports1m, undefined);
+  // prefer1m is the picker's starting selection, so only the default entry gets it.
+  assert.equal(entries[0].name, "claude-opus-4-8");
+  assert.equal(entries[0].prefer1m, true);
+  assert.equal(entryFor("claude-sonnet-4-5").prefer1m, undefined);
+});
+
+test("the discovery path never prefers 1M on an entry that does not advertise it", () => {
+  const { entries } = buildClaudeDesktopModelEntries(["claude-opus-4-8", "claude-haiku-4-5"], {
+    defaultModel: "claude-opus-4-8",
+    supports1m: (name) => name === "claude-haiku-4-5",
+    prefer1m: true
+  });
+  assert.equal(entries[0].supports1m, undefined);
+  assert.equal(entries[0].prefer1m, undefined);
+});
+
 test("only one entry per tier is marked as the family default", () => {
   const { entries } = buildClaudeDesktopModelEntries(["claude-opus-4-8", "claude-opus-4-7"], {
     opus: "claude-opus-4-8"
@@ -275,6 +339,20 @@ test("only a gateway entry reports a base URL", () => {
     ""
   );
   assert.equal(readClaudeDesktopGatewayBaseUrl(undefined), "");
+});
+
+test("a BOM-prefixed desktop config still parses", () => {
+  // These files live in a per-user directory people edit by hand; on Windows that
+  // means a leading BOM from Notepad or from PowerShell redirection, which made
+  // every read of an otherwise valid config fail as "不是有效的 JSON".
+  assert.equal(
+    readClaudeDesktopGatewayBaseUrl(
+      "﻿" + JSON.stringify({ inferenceProvider: "gateway", inferenceGatewayBaseUrl: "https://a.com" })
+    ),
+    "https://a.com"
+  );
+  const meta = parseClaudeDesktopMeta("﻿" + serializeClaudeDesktopMeta({ appliedId: "x", entries: [] }));
+  assert.equal(meta.appliedId, "x");
 });
 
 test("the standard alias set is one entry per tier and all names pass the app's check", () => {

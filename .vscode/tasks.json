@@ -11,49 +11,32 @@
 			"label": "npm: compile"
 		},
 		{
-			"label": "ai-provider-switcher: test (windows shell)",
-			"type": "shell",
-			"command": "cd /d C:\\Users\\63409\\Desktop\\claude配置 && npm test",
-			"options": {
-				"shell": {
-					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
-					"args": [
-						"/d",
-						"/s",
-						"/c"
-					]
-				}
-			}
+			"label": "ai-provider-switcher: test",
+			"type": "npm",
+			"script": "test",
+			"group": "test",
+			"problemMatcher": []
 		},
 		{
-			"label": "ai-provider-switcher: package (windows shell)",
+			"label": "ai-provider-switcher: package (vsix)",
 			"type": "shell",
-			"command": "cd /d C:\\Users\\63409\\Desktop\\claude配置 && npx vsce package",
+			"command": "npx vsce package",
 			"options": {
-				"shell": {
-					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
-					"args": [
-						"/d",
-						"/s",
-						"/c"
-					]
-				}
-			}
+				"cwd": "${workspaceFolder}"
+			},
+			"problemMatcher": []
 		},
 		{
-			"label": "ai-provider-switcher: package and install",
-			"type": "shell",
-			"command": "npx vsce package && code --install-extension ai-provider-switcher-0.5.1.vsix --force",
-			"options": {
-				"shell": {
-					"executable": "C:\\WINDOWS\\System32\\cmd.exe",
-					"args": [
-						"/d",
-						"/s",
-						"/c"
-					]
-				}
-			}
+			"label": "ai-provider-switcher: package and install (VS Code)",
+			"type": "npm",
+			"script": "install:vsix",
+			"problemMatcher": []
+		},
+		{
+			"label": "ai-provider-switcher: package and install (Insiders)",
+			"type": "npm",
+			"script": "install:vsix:insiders",
+			"problemMatcher": []
 		}
 	]
 }

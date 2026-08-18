@@ -1,3 +1,5 @@
+import * as path from "path";
+
 export const CODEX_MANAGED_BEGIN = "# BEGIN AI Provider Switcher managed Codex provider";
 export const CODEX_MANAGED_END = "# END AI Provider Switcher managed Codex provider";
 export const CODEX_ENV_MANAGED_BEGIN = "# BEGIN AI Provider Switcher managed Codex proxy";
@@ -13,6 +15,34 @@ const CODEX_PROXY_ENV_KEYS = new Set([
 
 export type CodexEnvEntry = { name: string; value: string; line: number };
 
+/**
+ * The line ending a file already uses. Every rewrite here is an edit of a file
+ * the user owns, so it must not convert a Windows CRLF file to LF wholesale
+ * just because one key changed.
+ */
+export function detectEol(content: string): "\r\n" | "\n" {
+  return content.includes("\r\n") ? "\r\n" : "\n";
+}
+
+/** Re-ends every line of a generated block with the target file's line ending. */
+function withEol(block: string, eol: "\r\n" | "\n"): string {
+  return eol === "\n" ? block : block.replace(/\r?\n/g, eol);
+}
+
+/**
+ * Codex reads `~/.codex` unless `CODEX_HOME` says otherwise, so every path this
+ * extension writes has to follow the same rule — writing to the default while
+ * Codex reads the override is a silent no-op with no error to show the user.
+ */
+export function resolveCodexHomeDir(env: NodeJS.ProcessEnv, homedir: string): string {
+  const configured = (env.CODEX_HOME ?? "").trim();
+  if (!configured) return path.join(homedir, ".codex");
+  const expanded = configured === "~" || configured.startsWith("~/") || configured.startsWith("~\\")
+    ? path.join(homedir, configured.slice(1))
+    : configured;
+  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(homedir, expanded);
+}
+
 export function createCodexAuthConfig(
   platform: NodeJS.Platform,
   helperFile: string,
@@ -27,13 +57,39 @@ export function createCodexAuthConfig(
   return { command: helperFile, args: [keyFile] };
 }
 
+/**
+ * Codex proxies through reqwest, which speaks SOCKS as well as HTTP. Rejecting
+ * socks5 forced anyone on a SOCKS-only proxy to give up on the whole feature.
+ */
+const CODEX_PROXY_PROTOCOLS = new Set([
+  "http:",
+  "https:",
+  "socks:",
+  "socks4:",
+  "socks4a:",
+  "socks5:",
+  "socks5h:"
+]);
+
 export function normalizeCodexProxyUrl(proxyUrl: string): string {
-  const parsed = new URL(proxyUrl.trim());
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error("代理地址必须使用 http:// 或 https://");
+  const text = proxyUrl.trim();
+  if (!text) throw new Error("代理地址不能为空");
+  // "127.0.0.1:7890" is what proxy apps display and what people paste, so treat a
+  // missing scheme as http rather than as a parse failure. Require "://" to detect
+  // the scheme — a bare colon would make "localhost:7890" look like scheme "localhost".
+  const withScheme = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text) ? text : `http://${text}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    throw new Error(`无法解析代理地址“${text}”，请填写形如 http://127.0.0.1:7890 的地址`);
+  }
+  if (!CODEX_PROXY_PROTOCOLS.has(parsed.protocol)) {
+    throw new Error("代理地址只支持 http://、https:// 或 socks5:// 等协议");
   }
   if (!parsed.hostname) throw new Error("代理地址缺少主机名");
-  if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+  // Non-special schemes such as socks5 keep an empty pathname instead of "/".
+  if ((parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) {
     throw new Error("代理地址不能包含路径、查询参数或片段");
   }
   return parsed.toString().replace(/\/$/, "");
@@ -68,6 +124,7 @@ export function removeManagedCodexEnv(content: string): string {
 
 export function updateManagedCodexEnv(content: string, proxyUrl: string): string {
   const normalizedProxyUrl = normalizeCodexProxyUrl(proxyUrl);
+  const eol = detectEol(content);
   const unmanaged = removeManagedCodexEnv(content);
   const managed = [
     CODEX_ENV_MANAGED_BEGIN,
@@ -75,8 +132,8 @@ export function updateManagedCodexEnv(content: string, proxyUrl: string): string
     `HTTPS_PROXY=${JSON.stringify(normalizedProxyUrl)}`,
     `NO_PROXY="localhost,127.0.0.1,::1"`,
     CODEX_ENV_MANAGED_END
-  ].join("\n");
-  return `${unmanaged}${unmanaged ? "\n\n" : ""}${managed}\n`;
+  ].join(eol);
+  return `${unmanaged}${unmanaged ? eol + eol : ""}${managed}${eol}`;
 }
 
 /** Store and display the provider origin, not a protocol-specific API path. */
@@ -106,6 +163,7 @@ export function updateTopLevelTomlKey(
   key: string,
   value: string | undefined
 ): string {
+  const eol = detectEol(content);
   const lines = content.split(/\r?\n/);
   const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
   const end = firstTable >= 0 ? firstTable : lines.length;
@@ -121,7 +179,7 @@ export function updateTopLevelTomlKey(
   } else if (value !== undefined) {
     lines.splice(end, 0, `${key} = ${JSON.stringify(value)}`);
   }
-  return lines.join("\n");
+  return lines.join(eol);
 }
 
 export function removeManagedCodexProviders(content: string): string {
@@ -139,9 +197,10 @@ export function removeManagedCodexProviders(content: string): string {
  * top-level `model_provider` key.
  */
 export function replaceManagedCodexProviders(content: string, managedBlock: string): string {
+  const eol = detectEol(content);
   const unmanaged = removeManagedCodexProviders(content).trimEnd();
   if (!managedBlock.trim()) return unmanaged;
-  return `${unmanaged}${unmanaged ? "\n\n" : ""}${managedBlock.trimEnd()}\n`;
+  return `${unmanaged}${unmanaged ? eol + eol : ""}${withEol(managedBlock.trimEnd(), eol)}${eol}`;
 }
 
 /**
@@ -243,16 +302,17 @@ export function removeUnmanagedCodexProxyEnv(content: string): string {
   const managedMatch = content.match(
     new RegExp(`${escapeRegExp(CODEX_ENV_MANAGED_BEGIN)}[\\s\\S]*?${escapeRegExp(CODEX_ENV_MANAGED_END)}`)
   )?.[0];
+  const eol = detectEol(content);
   const unmanaged = removeManagedCodexEnv(content)
     .split(/\r?\n/)
     .filter((line) => {
       const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/);
       return !match || !CODEX_PROXY_ENV_KEYS.has(match[1]);
     })
-    .join("\n")
+    .join(eol)
     .trimEnd();
   if (!managedMatch) return unmanaged;
-  return `${unmanaged}${unmanaged ? "\n\n" : ""}${managedMatch}\n`;
+  return `${unmanaged}${unmanaged ? eol + eol : ""}${withEol(managedMatch, eol)}${eol}`;
 }
 
 function unquoteEnvValue(value: string): string {
@@ -267,17 +327,136 @@ function unquoteEnvValue(value: string): string {
   return trimmed;
 }
 
-export function parseMacOsProxySettings(content: string): string | undefined {
+export type MacOsProxyConfiguration = {
+  /** A concrete host:port proxy Codex can be pointed at. */
+  manualUrl?: string;
+  /** A PAC script URL. Codex cannot evaluate PAC, so this only explains the failure. */
+  autoConfigUrl?: string;
+  /** WPAD auto-discovery, which likewise yields no address to write. */
+  autoDiscover: boolean;
+};
+
+/**
+ * `scutil --proxy` reports manual, PAC, and WPAD configurations side by side. Reading only
+ * the manual keys made a PAC-configured Mac look like it had no proxy at all, and the user
+ * was told to "确认系统代理已启用" for a proxy that was already on.
+ */
+export function parseMacOsProxyConfiguration(content: string): MacOsProxyConfiguration {
   const values = new Map<string, string>();
   for (const line of content.split(/\r?\n/)) {
     const match = line.match(/^\s*([A-Za-z]+)\s*:\s*(.+?)\s*$/);
     if (match) values.set(match[1], match[2]);
   }
+
+  let manualUrl: string | undefined;
   const protocol = values.get("HTTPSEnable") === "1" ? "HTTPS" :
     values.get("HTTPEnable") === "1" ? "HTTP" : undefined;
-  if (!protocol) return undefined;
-  const host = values.get(`${protocol}Proxy`);
-  const port = values.get(`${protocol}Port`);
-  if (!host || !port) return undefined;
-  return normalizeCodexProxyUrl(`http://${host}:${port}`);
+  if (protocol) {
+    const host = values.get(`${protocol}Proxy`);
+    const port = values.get(`${protocol}Port`);
+    if (host && port) manualUrl = normalizeCodexProxyUrl(`http://${host}:${port}`);
+  }
+
+  const autoConfigUrl = values.get("ProxyAutoConfigEnable") === "1"
+    ? values.get("ProxyAutoConfigURLString")?.trim() || undefined
+    : undefined;
+
+  return {
+    manualUrl,
+    autoConfigUrl,
+    autoDiscover: values.get("ProxyAutoDiscoveryEnable") === "1"
+  };
+}
+
+export function parseMacOsProxySettings(content: string): string | undefined {
+  return parseMacOsProxyConfiguration(content).manualUrl;
+}
+
+/**
+ * KDE keeps proxy settings in `~/.config/kioslaverc`, not in gsettings, so a Plasma desktop
+ * looked exactly like a machine with no proxy configured.
+ */
+export function parseKdeProxySettings(content: string): string | undefined {
+  const values = new Map<string, string>();
+  let inProxySection = false;
+  for (const line of content.split(/\r?\n/)) {
+    const section = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (section) {
+      inProxySection = section[1].trim().toLowerCase() === "proxy settings";
+      continue;
+    }
+    if (!inProxySection) continue;
+    const match = line.match(/^\s*([^=\s]+)\s*=\s*(.*?)\s*$/);
+    if (match) values.set(match[1], match[2]);
+  }
+  // ProxyType 1 is the manual configuration; 0 none, 2 PAC, 3 WPAD, 4 environment.
+  if (values.get("ProxyType") !== "1") return undefined;
+  const candidate = values.get("httpsProxy")?.trim() || values.get("httpProxy")?.trim();
+  if (!candidate) return undefined;
+  // KDE writes "http://127.0.0.1 7890" — a space where a colon belongs.
+  const normalized = candidate.replace(/\s+(\d+)$/, ":$1");
+  try {
+    return normalizeCodexProxyUrl(normalized);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Split a TOML table header into its key path. `[model_providers."custom"]`,
+ * `[model_providers.'custom']`, and `[ model_providers.custom ]` all name the same
+ * table, and treating them as different ones let a duplicate table be appended —
+ * which is a hard parse error that stops Codex from starting at all.
+ */
+export function parseTomlTableKeyPath(line: string): string[] | undefined {
+  const match = line.match(/^\s*\[\s*([^\[\]]*?)\s*\]\s*$/);
+  if (!match) return undefined;
+  const body = match[1];
+  const parts: string[] = [];
+  let index = 0;
+  while (index < body.length) {
+    while (index < body.length && /\s/.test(body[index])) index += 1;
+    if (index >= body.length) return undefined;
+    const quote = body[index];
+    let part: string;
+    if (quote === '"' || quote === "'") {
+      index += 1;
+      let raw = "";
+      while (index < body.length && body[index] !== quote) {
+        // Basic strings escape with backslash; literal strings ('…') do not.
+        if (quote === '"' && body[index] === "\\" && index + 1 < body.length) {
+          raw += body[index] + body[index + 1];
+          index += 2;
+          continue;
+        }
+        raw += body[index];
+        index += 1;
+      }
+      if (index >= body.length) return undefined;
+      index += 1;
+      if (quote === '"') {
+        try {
+          part = JSON.parse(`"${raw}"`) as string;
+        } catch {
+          return undefined;
+        }
+      } else {
+        part = raw;
+      }
+    } else {
+      let raw = "";
+      while (index < body.length && !/[.\s]/.test(body[index])) {
+        raw += body[index];
+        index += 1;
+      }
+      if (!/^[A-Za-z0-9_-]+$/.test(raw)) return undefined;
+      part = raw;
+    }
+    parts.push(part);
+    while (index < body.length && /\s/.test(body[index])) index += 1;
+    if (index >= body.length) break;
+    if (body[index] !== ".") return undefined;
+    index += 1;
+  }
+  return parts.length > 0 ? parts : undefined;
 }
