@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { CLAUDE_DESKTOP_ALIAS_MODELS } from "./claudeDesktop";
+import { CLAUDE_DESKTOP_GENERIC_TIER_ALIASES } from "./claudeDesktop";
 
 export type ProviderManagerAction =
   | "ready"
@@ -35,8 +35,15 @@ export type ProviderManagerAction =
   | "reorderProviders"
   | "backToOverview"
   | "editProviderModels"
+  | "editClaudeCodeModels"
+  | "editClaudeDesktopModels"
+  | "configureCurrentClaudeCodeModels"
+  | "configureCurrentClaudeDesktopModels"
+  | "openServiceLibrary"
   | "cancelProviderModelEdit"
   | "saveProviderModels"
+  | "saveClaudeCodeModels"
+  | "saveClaudeDesktopModels"
   | "autoAssignModelRoles"
   | "fetchProviderModels"
   | "openCodex";
@@ -50,6 +57,10 @@ export type ProviderModelFormPayload = {
   models: ProviderModelRow[];
   effort: string;
   desktopModels: Array<{ name: string; supports1m: boolean }>;
+  /** Real model IDs selected for individually-routable Desktop catalogue entries. */
+  desktopRoutes: Array<{ name: string; supports1m: boolean }>;
+  /** Which user-facing surface this draft belongs to; host saves only that surface. */
+  surface?: "code" | "desktop";
 };
 
 export type ProviderManagerMessage = {
@@ -99,6 +110,10 @@ export type ProviderManagerState = {
     modelList: ProviderModelRow[];
     effortLevel: string;
     desktopModels: Array<{ name: string; supports1m: boolean }>;
+    /** Selected models that get their own safe route in Claude Desktop. */
+    desktopRoutes: Array<{ name: string; supports1m: boolean }>;
+    /** Whether this provider is Claude Desktop's live service. */
+    desktopActive: boolean;
     /**
      * True when none of the gateway's own model IDs are ones Claude Desktop
      * will accept, so aliases are the only way to reach it from the app.
@@ -129,7 +144,7 @@ export class ProviderManagerPanel {
     extensionUri: vscode.Uri,
     getState: () => ProviderManagerState,
     onAction: (message: ProviderManagerMessage) => Promise<ProviderManagerActionResult | void>,
-    focus?: { kind: "claude" | "codex"; id: string; edit?: boolean }
+    focus?: { kind: "claude" | "codex"; id: string; edit?: boolean; modelSurface?: "code" | "desktop" }
   ): void {
     if (ProviderManagerPanel.current) {
       ProviderManagerPanel.current.panel.reveal(vscode.ViewColumn.One);
@@ -153,8 +168,9 @@ export class ProviderManagerPanel {
   }
 
   private selectedProvider: { kind: "claude" | "codex"; id: string } | undefined;
+  private view: "home" | "serviceLibrary" | "provider" | "codeSetup" | "desktopSetup" = "home";
   private editing = false;
-  private editingModels = false;
+  private editingModels: "code" | "desktop" | undefined;
   /** Survives a rejected save so the form can be re-rendered with what was typed. */
   private pendingDraft: { name: string; baseUrl: string } | undefined;
   private pendingModelForm: ProviderModelFormPayload | undefined;
@@ -176,15 +192,23 @@ export class ProviderManagerPanel {
         this.render();
         return;
       }
+      if (message.action === "openServiceLibrary") {
+        this.leaveEditing();
+        this.view = "serviceLibrary";
+        this.render();
+        return;
+      }
       if (message.action === "openClaudeProvider" || message.action === "openCodexProvider") {
         this.select(message);
         this.leaveEditing();
+        this.view = "provider";
         this.render();
         return;
       }
       if (message.action === "backToOverview") {
         this.selectedProvider = undefined;
         this.leaveEditing();
+        this.view = "home";
         this.render();
         return;
       }
@@ -192,14 +216,24 @@ export class ProviderManagerPanel {
         // The list's inline edit button both selects the provider and opens its form.
         if (message.action === "editProvider") this.select(message);
         this.leaveEditing();
+        this.view = "provider";
         this.editing = message.action === "editProvider";
         this.render();
         return;
       }
-      if (message.action === "editProviderModels" || message.action === "cancelProviderModelEdit") {
-        if (message.action === "editProviderModels") this.select(message);
+      if (
+        message.action === "editProviderModels"
+        || message.action === "editClaudeCodeModels"
+        || message.action === "editClaudeDesktopModels"
+        || message.action === "cancelProviderModelEdit"
+      ) {
+        if (message.action !== "cancelProviderModelEdit") this.select(message);
         this.leaveEditing();
-        this.editingModels = message.action === "editProviderModels";
+        this.editingModels = message.action === "editClaudeDesktopModels"
+          ? "desktop"
+          : message.action === "cancelProviderModelEdit" ? undefined : "code";
+        this.view = this.editingModels === "desktop" ? "desktopSetup" : "codeSetup";
+        if (message.action === "cancelProviderModelEdit") this.view = "provider";
         this.render();
         return;
       }
@@ -209,10 +243,12 @@ export class ProviderManagerPanel {
         this.retainDraft(this.editing ? message.draft : undefined, result?.message);
       } else if (
         message.action === "saveProviderModels"
+        || message.action === "saveClaudeCodeModels"
+        || message.action === "saveClaudeDesktopModels"
         || message.action === "autoAssignModelRoles"
         || message.action === "fetchProviderModels"
       ) {
-        this.editingModels = result?.keepEditing === true;
+        this.editingModels = result?.keepEditing === true ? this.editingModels : undefined;
         // A host-recomputed draft wins over what was submitted — that is how the
         // assigned roles and the fetched models get back onto the screen.
         this.pendingModelForm = this.editingModels
@@ -235,7 +271,7 @@ export class ProviderManagerPanel {
 
   private leaveEditing(): void {
     this.editing = false;
-    this.editingModels = false;
+    this.editingModels = undefined;
     this.pendingDraft = undefined;
     this.pendingModelForm = undefined;
     this.notice = undefined;
@@ -259,11 +295,13 @@ export class ProviderManagerPanel {
   }
 
   /** Jump straight to one provider — used by the palette commands so they land on the form. */
-  private focusProvider(focus?: { kind: "claude" | "codex"; id: string; edit?: boolean }): void {
+  private focusProvider(focus?: { kind: "claude" | "codex"; id: string; edit?: boolean; modelSurface?: "code" | "desktop" }): void {
     if (focus) {
       this.selectedProvider = { kind: focus.kind, id: focus.id };
       this.leaveEditing();
       this.editing = focus.edit === true;
+      this.editingModels = focus.modelSurface;
+      this.view = focus.modelSurface === "desktop" ? "desktopSetup" : focus.modelSurface === "code" ? "codeSetup" : "provider";
     }
     this.render();
   }
@@ -281,20 +319,25 @@ export class ProviderManagerPanel {
       this.leaveEditing();
     }
     const selected = this.selectedProvider ? findProvider(state, this.selectedProvider) : undefined;
+    const detail = this.view === "home"
+      ? overviewPane(state)
+      : this.view === "serviceLibrary"
+        ? serviceLibraryPane(state)
+        : selected
+          ? providerDetail(
+              selected.kind,
+              selected.provider,
+              this.editing ? { draft: this.pendingDraft, notice: this.notice } : undefined,
+              this.editingModels && selected.kind === "claude"
+                ? { draft: this.pendingModelForm, notice: this.notice, surface: this.editingModels }
+                : undefined
+            )
+          : serviceLibraryPane(state);
     void this.panel.webview.postMessage({
       type: "render",
       status: `${statusChip("Claude", state.claudeMode, state.claudeOfficial)}${statusChip("Claude Desktop", state.claudeDesktopMode, state.claudeDesktopOfficial)}${statusChip("Codex", state.codexMode, state.codexOfficial)}`,
       list: providerList(state, this.selectedProvider),
-      detail: selected
-        ? providerDetail(
-            selected.kind,
-            selected.provider,
-            this.editing ? { draft: this.pendingDraft, notice: this.notice } : undefined,
-            this.editingModels && selected.kind === "claude"
-              ? { draft: this.pendingModelForm, notice: this.notice }
-              : undefined
-          )
-        : overviewPane(state)
+      detail
     });
   }
 
@@ -416,7 +459,7 @@ export class ProviderManagerPanel {
 
     .model-form input[type="text"], .model-form select { width: 100%; padding: 7px 10px; border: 1px solid var(--vscode-input-border, var(--vscode-widget-border)); border-radius: 7px; color: var(--vscode-input-foreground); background: var(--vscode-input-background); font: inherit; font-size: 12px; }
     .model-form input[type="text"]:focus-visible, .model-form select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
-    .model-rows, .desktop-model-rows { display: grid; gap: 8px; margin-top: 12px; }
+    .model-rows, .desktop-model-rows, .desktop-route-rows { display: grid; gap: 8px; margin-top: 12px; }
     .model-row { display: grid; grid-template-columns: minmax(0, 1fr) 150px 54px 28px; gap: 8px; align-items: center; }
     .model-1m { justify-self: start; }
     .row-tools { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -425,6 +468,14 @@ export class ProviderManagerPanel {
     .env-preview b { flex: 0 0 auto; color: var(--vscode-descriptionForeground); font-weight: 400; }
     .env-preview i { font-style: normal; color: var(--vscode-textLink-foreground); }
     .env-preview .env-empty { color: var(--vscode-descriptionForeground); font-family: var(--vscode-font-family); }
+    .desktop-route-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 9px; border: 1px solid var(--vscode-panel-border); border-radius: 5px; margin-top: 6px; }
+    .desktop-route-name { overflow-wrap: anywhere; }
+    .advanced-compat { margin-top: 16px; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: var(--vscode-editor-background); }
+    .advanced-compat > summary { padding: 10px 12px; cursor: pointer; color: var(--vscode-descriptionForeground); font-size: 12px; }
+    .advanced-compat > summary strong { color: var(--vscode-foreground); }
+    .advanced-compat-body { padding: 0 12px 12px; }
+    .advanced-compat-body > p { margin: 0 0 10px; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.55; }
+    .compat-disabled { color: var(--vscode-inputValidation-warningForeground, var(--vscode-descriptionForeground)); }
     .desktop-model-row { display: grid; grid-template-columns: minmax(0, 1fr) 54px 28px; gap: 8px; align-items: center; }
     .model-section { align-items: start; }
     .check-row { display: flex; gap: 6px; align-items: center; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.5; }
@@ -465,18 +516,34 @@ export class ProviderManagerPanel {
     const vscode = acquireVsCodeApi();
     const fieldValue = (id) => { const field = document.getElementById(id); return field ? field.value : ''; };
     const readDraft = () => ({ name: fieldValue('edit-name'), baseUrl: fieldValue('edit-base-url'), secret: fieldValue('edit-secret') });
-    const readModelForm = () => ({
-      models: Array.from(document.querySelectorAll('.model-row')).map((row) => ({
+    const readModelForm = () => {
+      const surface = document.querySelector('.model-form')?.dataset.surface || 'code';
+      const advanced = Boolean(document.querySelector('[data-code-advanced]')?.open);
+      const rows = Array.from(document.querySelectorAll('.model-row')).map((row) => ({
         name: row.querySelector('.model-name').value.trim(),
         role: row.querySelector('.model-role').value,
         supports1m: Boolean(row.querySelector('.model-1m input')?.checked)
-      })),
-      effort: fieldValue('model-effort'),
-      desktopModels: Array.from(document.querySelectorAll('.desktop-model-row')).map((row) => ({
-        name: row.querySelector('.desktop-model-name').value.trim(),
-        supports1m: Boolean(row.querySelector('.desktop-model-1m')?.checked)
-      }))
-    });
+      }));
+      const quickMain = fieldValue('code-quick-main');
+      const quickFast = fieldValue('code-quick-fast') || quickMain;
+      const quickRows = quickMain ? [
+        { name: quickMain, role: 'main', supports1m: Boolean(document.getElementById('code-quick-main-1m')?.checked) },
+        ...(quickFast !== quickMain ? [{ name: quickFast, role: 'haiku', supports1m: Boolean(document.getElementById('code-quick-fast-1m')?.checked) }] : [])
+      ] : [];
+      return {
+        models: surface === 'code' && !advanced ? quickRows : rows,
+        effort: surface === 'code' && !advanced ? fieldValue('code-quick-effort') : fieldValue('model-effort'),
+        desktopModels: Array.from(document.querySelectorAll('.desktop-model-row')).map((row) => ({
+          name: row.querySelector('.desktop-model-name').value.trim(),
+          supports1m: Boolean(row.querySelector('.desktop-model-1m')?.checked)
+        })),
+        desktopRoutes: Array.from(document.querySelectorAll('.desktop-route-row')).flatMap((row) => {
+          if (!row.querySelector('.desktop-route-select')?.checked) return [];
+          return [{ name: row.dataset.model || '', supports1m: Boolean(row.querySelector('.desktop-route-1m input')?.checked) }];
+        }),
+        surface
+      };
+    };
     const addModelRow = () => {
       const template = document.getElementById('model-row-template');
       const container = document.getElementById('model-rows');
@@ -547,7 +614,7 @@ export class ProviderManagerPanel {
       providerKind: element.dataset.providerKind,
       providerId: element.dataset.providerId,
       draft: element.dataset.action === 'saveProviderEdit' ? readDraft() : undefined,
-      modelForm: element.dataset.action === 'saveProviderModels' ? readModelForm() : undefined
+      modelForm: ['saveProviderModels', 'saveClaudeCodeModels', 'saveClaudeDesktopModels', 'autoAssignModelRoles', 'fetchProviderModels'].includes(element.dataset.action) ? readModelForm() : undefined
     });
     const asElement = (node) => node instanceof Element ? node : null;
     const closest = (event, selector) => { const node = asElement(event.target); return node ? node.closest(selector) : null; };
@@ -558,6 +625,14 @@ export class ProviderManagerPanel {
       const menu = closest(event, 'details.overflow');
       document.querySelectorAll('details.overflow[open]').forEach((open) => { if (open !== menu) open.open = false; });
       if (closest(event, '[data-model-add]')) { addModelRow(); renderPreview(); return; }
+      if (closest(event, '[data-desktop-routes-all]')) {
+        document.querySelectorAll('.desktop-route-select').forEach((box) => { box.checked = true; });
+        return;
+      }
+      if (closest(event, '[data-desktop-routes-clear]')) {
+        document.querySelectorAll('.desktop-route-select, .desktop-route-1m').forEach((box) => { box.checked = false; });
+        return;
+      }
       if (closest(event, '[data-desktop-add]')) { addDesktopModelRow(); return; }
       const standard = closest(event, '[data-desktop-standard]');
       if (standard) { fillStandardAliases(JSON.parse(standard.dataset.desktopStandard)); return; }
@@ -733,27 +808,40 @@ function listSection(
   return `<div class="list-section"><div class="list-head"><span>${title}</span><button class="icon" title="添加${title}中转服务" aria-label="添加${title}中转服务" data-action="${addAction}">＋</button></div><div class="provider-list" data-kind="${kind}">${officialRow}${rows}</div>${providers.length > 1 ? '<div class="drop-hint">拖动 ⠿ 调整顺序</div>' : ""}</div>`;
 }
 
-/** Shown when no provider is selected: the two global action sets, with nothing hidden from before. */
+function serviceLibraryPane(state: ProviderManagerState): string {
+  const claudeCount = state.claudeProviders.length;
+  const codexCount = state.codexProviders.length;
+  return `<article class="card"><div class="detail-top"><button class="ghost" data-action="backToOverview">← 返回配置首页</button><span class="badge">服务库</span></div><div class="detail-heading"><span class="provider-icon">▤</span><div><h2>服务库</h2><small class="url">添加、编辑、排序或删除中转服务。先从左侧选择服务；这里的连接信息可供 Claude Code 和 Claude Desktop 共用。</small></div></div><div class="detail-grid"><div class="detail-item"><span class="detail-label">Claude 服务</span><strong>${claudeCount} 个已保存服务</strong><small class="field-hint">点左侧 Claude 服务查看共享连接信息、Code 与 Desktop 的独立设置。</small></div><div class="detail-item"><span class="detail-label">Codex 服务</span><strong>${codexCount} 个已保存服务</strong><small class="field-hint">点左侧 Codex 服务配置模型、代理和额度。</small></div></div><div class="detail-section"><div><h3>添加服务</h3><p>服务是连接地址与 Token 的保存记录；它本身不会切换任何产品。</p></div>${actionBar([{ label: "添加 Claude 服务", action: "addClaudeProvider", primary: true }, { label: "添加 Codex 服务", action: "addCodexProvider" }])}</div></article>`;
+}
+
+/** Shown when no provider is selected: product-first task entrypoints. */
 function overviewPane(state: ProviderManagerState): string {
   // A remote window writes to the remote host's home directory — right for the
   // CLIs, impossible for the local desktop app. Say so before anything else.
   const remote = state.remoteNotice
     ? `<div class="form-notice" role="note"><span>⧉</span><span>${escapeHtml(state.remoteNotice)}</span></div>`
     : "";
-  const claude =`<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">✦</span><h2>Claude</h2></div><span class="badge">${escapeHtml(state.claudeMode)}</span></div><div class="model">从左侧选择一个服务查看详情、编辑配置或配置额度。${state.claudeProviders.length ? "" : "还没有中转服务，点左侧的 ＋ 添加。"}<br>终端 CLI 与 VS Code 内共用同一配置；Desktop 独立：<strong>${escapeHtml(state.claudeDesktopMode)}</strong>（切换后需完全退出并重启桌面应用）。</div>${actionBar(
+  const claudeCodeCard = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">✦</span><h2>Claude Code（VS Code / 终端）</h2></div><span class="badge">${escapeHtml(state.claudeMode)}</span></div><div class="model">当前模型与命令策略作用于 VS Code 内 Claude Code 和终端 <code>claude</code>。<strong>不会切换 Claude Desktop。</strong></div>${actionBar(
     [
-      { label: "快速切换", action: "switchClaude", primary: true },
-      { label: "使用官方", action: "claudeOfficial" },
-      { label: "切换 Desktop 服务", action: "switchClaudeDesktop" },
-      { label: "模型映射", action: "mapClaudeModels" },
-      { label: "命令策略", action: "configureClaudePermissions" }
+      { label: "切换 Claude Code 服务", action: "switchClaude", primary: true },
+      { label: "使用 Claude 官方订阅", action: "claudeOfficial" },
+      { label: "配置 Claude Code 模型", action: "configureCurrentClaudeCodeModels" }
     ],
     [
+      { label: "命令策略", action: "configureClaudePermissions" },
       { label: "刷新模型", action: "refreshClaude" },
       { label: "检测外部配置", action: "inspectClaude" },
       { label: "管理服务（命令菜单）", action: "manageClaude" }
     ]
   )}</article>`;
+  const desktopCard = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">▣</span><h2>Claude Desktop（独立应用）</h2></div><span class="badge">${escapeHtml(state.claudeDesktopMode)}</span></div><div class="model">Desktop 有自己的服务与模型目录，独立于 VS Code 和终端。切换或保存后需要<strong>完全退出并重新打开 Claude Desktop</strong>。</div>${actionBar(
+    [
+      { label: "切换 Claude Desktop 服务", action: "switchClaudeDesktop", primary: true }
+    ],
+    [{ label: "管理 Desktop 模型", action: "configureCurrentClaudeDesktopModels" }]
+  )}</article>`;
+  const libraryCard = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">▤</span><h2>服务库</h2></div><span class="badge">${state.claudeProviders.length + state.codexProviders.length} 个服务</span></div><div class="model">添加或编辑中转站的地址、Token、排序和额度。服务资料可被 Claude Code 与 Claude Desktop 共用，但不会因为查看服务库而切换任何产品。</div>${actionBar([{ label: "管理服务库", action: "openServiceLibrary", primary: true }])}</article>`;
+  const claude = `${claudeCodeCard}${desktopCard}${libraryCard}`;
   const codexModel = state.codexModel
     ? `默认模型：${state.codexModel}（可随时在 Codex 原生模型栏临时改用其它模型）`
     : "未固定默认模型，由 Codex 页面原生模型栏决定";
@@ -811,29 +899,17 @@ function providerDetail(
   kind: "claude" | "codex",
   provider: ProviderView,
   edit?: { draft?: { name: string; baseUrl: string }; notice?: string },
-  modelEdit?: { draft?: ProviderModelFormPayload; notice?: string }
+  modelEdit?: { draft?: ProviderModelFormPayload; notice?: string; surface: "code" | "desktop" }
 ): string {
   const isClaude = kind === "claude";
   if (edit) return providerEditForm(kind, provider, edit);
-  if (modelEdit && isClaude) return providerModelForm(provider as ProviderManagerState["claudeProviders"][number], modelEdit);
+  if (modelEdit && isClaude) return providerModelForm(
+    provider as ProviderManagerState["claudeProviders"][number],
+    modelEdit
+  );
   const claudeProvider = isClaude ? provider as ProviderManagerState["claudeProviders"][number] : undefined;
   const codexProvider = !isClaude ? provider as ProviderManagerState["codexProviders"][number] : undefined;
   const target: ActionTarget = { kind, id: provider.id };
-  const inline: ActionItem[] = isClaude
-    ? [
-        { label: provider.active ? "重新应用此服务" : "切换到此服务", action: "switchClaude", primary: true },
-        { label: "编辑配置", action: "editProvider" },
-        { label: "模型与参数", action: "editProviderModels" },
-        { label: "命令策略", action: "configureClaudePermissions" }
-      ]
-    : [
-        { label: provider.active ? "重新应用此服务" : "切换到此服务", action: "switchCodex", primary: true },
-        { label: "编辑配置", action: "editProvider" },
-        { label: "选择默认模型", action: "configureCodexModel" }
-      ];
-  const overflow: ActionItem[] = isClaude
-    ? [{ label: "刷新模型", action: "refreshClaude" }, { label: "模型映射（向导）", action: "mapClaudeModels" }, { label: "检测外部配置", action: "inspectClaude" }, { label: "删除此服务", action: "removeProvider" }]
-    : [{ label: "刷新模型", action: "refreshCodex" }, { label: "配置连接代理", action: "configureCodexProxy" }, { label: "打开 Codex", action: "openCodex" }, { label: "删除此服务", action: "removeProvider" }];
   const usageInline: ActionItem[] = [
     { label: "刷新额度", action: "refreshUsage", primary: true },
     provider.hasUsageConfig
@@ -844,13 +920,29 @@ function providerDetail(
     { label: "查看额度配置", action: "viewUsageConfig" },
     { label: "删除额度配置", action: "deleteUsageConfig" }
   ];
-  const mapping = isClaude
-    ? `模型映射：${escapeHtml(claudeProvider?.mapping ?? "未配置")}<br>命令策略：${escapeHtml(claudeProvider?.permissionStrategy ?? "未配置")}`
-    : `${escapeHtml(String(codexProvider?.modelCount ?? 0))} 个已缓存模型`;
   const usageDetail = provider.hasUsageConfig
     ? `<div class="detail-value"><span class="usage-pill configured">已配置额度 API</span><small class="url">${escapeHtml(provider.usageEndpoint ?? "")}</small>${provider.usageMappings ? `<small class="url">字段：${escapeHtml(provider.usageMappings)}</small>` : ""}</div>`
     : `<div class="detail-value"><span class="usage-pill">未配置额度 API</span><small class="url">可从此页面直接添加和管理</small></div>`;
-  return `<article class="card">${detailTop(isClaude)}<div class="detail-heading"><span class="provider-icon">${isClaude ? "✦" : "⌁"}</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div><div class="detail-grid"><div class="detail-item"><span class="detail-label">连接状态</span><strong>${provider.active ? "当前服务" : "可用服务"}</strong></div><div class="detail-item"><span class="detail-label">${isClaude ? "模型与策略" : "模型缓存"}</span><strong>${mapping}</strong></div><div class="detail-item detail-wide"><span class="detail-label">额度配置</span>${usageDetail}</div></div><div class="detail-section"><div><h3>服务操作</h3><p>所有操作都针对当前选中的服务，不需要再从菜单二次选择。</p></div>${actionBar(inline, overflow, target)}</div><div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
+  if (!isClaude) {
+    const inline: ActionItem[] = [
+      { label: provider.active ? "重新应用此服务" : "切换到此服务", action: "switchCodex", primary: true },
+      { label: "编辑配置", action: "editProvider" },
+      { label: "选择默认模型", action: "configureCodexModel" }
+    ];
+    const overflow: ActionItem[] = [
+      { label: "刷新模型", action: "refreshCodex" }, { label: "配置连接代理", action: "configureCodexProxy" }, { label: "打开 Codex", action: "openCodex" }, { label: "删除此服务", action: "removeProvider" }
+    ];
+    return `<article class="card">${detailTop(false)}<div class="detail-heading"><span class="provider-icon">⌁</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div><div class="detail-grid"><div class="detail-item"><span class="detail-label">连接状态</span><strong>${provider.active ? "当前服务" : "可用服务"}</strong></div><div class="detail-item"><span class="detail-label">模型缓存</span><strong>${escapeHtml(String(codexProvider?.modelCount ?? 0))} 个已缓存模型</strong></div><div class="detail-item detail-wide"><span class="detail-label">额度配置</span>${usageDetail}</div></div><div class="detail-section"><div><h3>服务操作</h3><p>所有操作都针对当前选中的服务，不需要再从菜单二次选择。</p></div>${actionBar(inline, overflow, target)}</div><div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
+  }
+  const desktopStatus = claudeProvider?.desktopActive
+    ? `Desktop 当前正在使用此服务${claudeProvider.desktopRoutes.length ? `，已配置 ${claudeProvider.desktopRoutes.length} 个模型` : ""}。`
+    : claudeProvider?.desktopRoutes.length
+      ? `已预先配置 ${claudeProvider.desktopRoutes.length} 个 Desktop 模型；下次切换 Desktop 到此服务时带入。`
+      : "尚未配置 Desktop 模型；可先配置，切换 Desktop 服务时会带入。";
+  const shared = `<div class="detail-section"><div><h3>共享连接信息</h3><p>名称、Base URL 与 Token 是同一个中转站的资料。若 Claude Code 或 Claude Desktop 正在使用此服务，保存后会同步正在使用的一端。</p></div>${actionBar([{ label: "编辑连接信息", action: "editProvider", primary: true }], [{ label: "删除此服务", action: "removeProvider" }], target)}</div>`;
+  const code = `<div class="detail-section"><div><h3>Claude Code（VS Code / 终端）</h3><p>当前：${escapeHtml(claudeProvider?.mapping ?? "未配置")} · 命令策略：${escapeHtml(claudeProvider?.permissionStrategy ?? "未配置")}。模型角色、1M 与 effort 只写入 VS Code 内 Claude Code 和终端 CLI，不会配置 Desktop。</p></div>${actionBar([{ label: "配置 Claude Code 模型", action: "editClaudeCodeModels", primary: true }, { label: provider.active ? "重新应用 Claude Code" : "切换 Claude Code 服务", action: "switchClaude" }], [{ label: "命令策略", action: "configureClaudePermissions" }, { label: "刷新模型", action: "refreshClaude" }, { label: "检测外部配置", action: "inspectClaude" }], target)}</div>`;
+  const desktop = `<div class="detail-section"><div><h3>Claude Desktop（独立应用）</h3><p>${escapeHtml(desktopStatus)} Desktop 模型目录和本地代理只影响独立桌面应用，不改变 Claude Code 或终端。</p></div>${actionBar([{ label: "配置 Desktop 模型", action: "editClaudeDesktopModels", primary: true }, { label: "切换 Desktop 服务", action: "switchClaudeDesktop" }], [], target)}</div>`;
+  return `<article class="card">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">Claude Code 使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div>${shared}${code}${desktop}<div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
 }
 
 const MODEL_ROLE_OPTIONS: Array<{ value: string; label: string }> = [
@@ -891,13 +983,15 @@ const MODEL_EFFORT_OPTIONS: Array<{ value: string; label: string }> = [
  */
 function providerModelForm(
   provider: ProviderManagerState["claudeProviders"][number],
-  edit: { draft?: ProviderModelFormPayload; notice?: string }
+  edit: { draft?: ProviderModelFormPayload; notice?: string; surface: "code" | "desktop" }
 ): string {
+  const surface = edit.surface;
   const target: ActionTarget = { kind: "claude", id: provider.id };
   const form = edit.draft ?? {
     models: provider.modelList,
     effort: provider.effortLevel,
-    desktopModels: provider.desktopModels
+    desktopModels: provider.desktopModels,
+    desktopRoutes: provider.desktopRoutes
   };
   const notice = edit.notice
     ? `<div class="form-notice" role="alert"><span>⚠</span><span>${escapeHtml(edit.notice)}</span></div>`
@@ -911,25 +1005,52 @@ function providerModelForm(
   const desktopRows = form.desktopModels.length
     ? form.desktopModels.map((entry) => desktopModelRow(entry.name, entry.supports1m)).join("")
     : "";
-  return `<article class="card model-form">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>模型与参数 — ${escapeHtml(provider.name)}</h2><small class="url">角色映射决定 Claude 各模型族与子代理使用哪个模型；1M 与 effort 会写入 VS Code、终端 CLI 与 Desktop 三端配置。</small></div></div>${notice}
-<div class="detail-section model-section"><div><h3>模型列表与角色</h3><p>模型 ID 将原样发送给网关。必须有一个模型担任「主模型」，未指派的角色会回落到它。同一角色重复时以第一个为准。1M 按模型声明：勾选后该模型在它承担的每个角色上都以 [1m] 后缀发送，未指派角色的模型也能保留勾选。</p></div></div>
-<div class="model-rows" id="model-rows">${rows}</div>
-<div class="row-tools"><button class="ghost" type="button" data-model-add>＋ 添加模型</button><button class="ghost" type="button" data-action="fetchProviderModels" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">⟳ 从服务获取模型列表</button><button class="ghost" type="button" data-action="autoAssignModelRoles" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">✨ 自动分配角色</button></div>
-<template id="model-row-template">${modelRow("", "", false)}</template>
-<div class="detail-section model-section"><div><h3>保存后将写入</h3><p>下面是这份配置最终发送给 Claude Code 的模型名。未指派的角色回落到主模型，勾选 1M 的模型带 [1m] 后缀。</p></div></div>
-<div class="env-preview" id="env-preview"></div>
-<div class="detail-section model-section"><div><h3>Claude Desktop 模型名（可选）</h3><p>仅当网关的真实模型名不被 Desktop 接受时才需要（如 DeepSeek）。每个别名的 1M 开关独立：勾选后桌面选择器才会为它提供 1M 上下文变体。</p></div></div>${desktopAliasHint(provider)}
-<div class="desktop-model-rows" id="desktop-model-rows">${desktopRows}</div>
-<div class="row-tools"><button class="ghost" type="button" data-desktop-add>＋ 添加桌面模型名</button><button class="ghost" type="button" data-desktop-standard='${escapeHtml(JSON.stringify(CLAUDE_DESKTOP_ALIAS_MODELS))}'>⚡ 填入标准 Claude 别名</button></div>
-<template id="desktop-model-row-template">${desktopModelRow("", false)}</template>
-<div class="detail-grid">
-<div class="detail-item detail-wide"><span class="detail-label">推理强度（effort）</span><select id="model-effort" class="form-select">${effortOptions(form.effort)}</select><small class="field-hint">写入 CLAUDE_CODE_EFFORT_LEVEL。选「不设置」则完全不写这个变量，交给 Claude Code 自己的默认；auto 也是一个会被写入的取值。</small></div>
-</div>
-<div class="detail-section"><div><h3>保存</h3><p>${provider.active ? "该服务正在使用，保存后重新应用即生效。" : "保存后切换到此服务时即生效。"}</p></div>${actionBar(
-  [{ label: "保存", action: "saveProviderModels", primary: true }, { label: "取消", action: "cancelProviderModelEdit" }],
-  [],
-  target
-)}</div></article>`;
+  const desktopRouteRows = form.models.length
+    ? form.models.map((row) => desktopRouteRow(
+      row.name,
+      (form.desktopRoutes ?? []).some((entry) => entry.name === row.name && entry.supports1m),
+      (form.desktopRoutes ?? []).some((entry) => entry.name === row.name)
+    )).join("")
+    : '<div class="env-empty">先填写或从服务获取模型列表，才能添加 Desktop 全模型目录。</div>';
+  const routeCount = (form.desktopRoutes ?? []).length;
+  const compatOpen = routeCount === 0 && form.desktopModels.length > 0;
+  const compatState = routeCount > 0
+    ? `<span class="compat-disabled">全模型目录已启用（${routeCount} 个模型），以下设置当前不参与路由。</span>`
+    : form.desktopModels.length > 0
+      ? "检测到旧版别名配置，当前正在使用兼容模式。"
+      : "通常不需要；只有服务商明确要求发送兼容别名时才配置。";
+  const compatSection = `<details class="advanced-compat"${compatOpen ? " open" : ""}><summary><strong>高级：旧版兼容别名</strong> · ${compatState}</summary><div class="advanced-compat-body"><p>这是服务商自己翻译名称的旧模式，不是 Claude 官方模型列表。通用档位名只表示 Desktop 的分类：opus＝最高能力、sonnet＝通用、haiku＝快速/低成本、fable＝增强推理；它们不等同于任何具体 Claude 版本。只有服务商文档明确说支持时才使用。若不确定，请留空并使用上方全模型目录。</p>${desktopAliasHint(provider)}<div class="desktop-model-rows" id="desktop-model-rows">${desktopRows}</div><div class="row-tools"><button class="ghost" type="button" data-desktop-add>＋ 添加服务商兼容别名</button><button class="ghost" type="button" data-desktop-standard='${escapeHtml(JSON.stringify(CLAUDE_DESKTOP_GENERIC_TIER_ALIASES))}'>⚡ 填入通用档位名（需服务商支持）</button></div><template id="desktop-model-row-template">${desktopModelRow("", false)}</template></div></details>`;
+  const quickOptions = (selected: string, allowEmpty = false): string => [
+    ...(allowEmpty ? [{ name: "", label: "与主模型相同（推荐）" }] : [{ name: "", label: "请选择主模型" }]),
+    ...form.models.filter((row) => row.name.trim()).map((row) => ({ name: row.name.trim(), label: row.name.trim() }))
+  ].map((option) => `<option value="${escapeHtml(option.name)}"${option.name === selected ? " selected" : ""}>${escapeHtml(option.label)}</option>`).join("");
+  const quickMain = form.models.find((row) => row.role === "main")?.name.trim() ?? "";
+  const quickFast = form.models.find((row) => row.role === "haiku")?.name.trim() ?? "";
+  const quickMain1m = form.models.some((row) => row.name.trim() === quickMain && row.supports1m);
+  const quickFast1m = form.models.some((row) => row.name.trim() === quickFast && row.supports1m);
+  const codeBody = `<div class="detail-section model-section"><div><h3>推荐配置</h3><p>大多数人只需要选一个主模型；需要更快或更便宜的后台任务时，再选一个快速模型。这里的选择只写入 Claude Code 和终端 CLI，不影响 Claude Desktop。</p></div></div>
+<div class="detail-grid quick-code"><div class="detail-item"><span class="detail-label">主模型</span><select id="code-quick-main" class="form-select">${quickOptions(quickMain)}</select><label class="check-row"><input id="code-quick-main-1m" type="checkbox"${quickMain1m ? " checked" : ""}><span>这个模型支持 1M 上下文</span></label></div><div class="detail-item"><span class="detail-label">快速模型（可选）</span><select id="code-quick-fast" class="form-select">${quickOptions(quickFast, true)}</select><label class="check-row"><input id="code-quick-fast-1m" type="checkbox"${quickFast1m ? " checked" : ""}><span>这个模型支持 1M 上下文</span></label></div><div class="detail-item detail-wide"><span class="detail-label">推理强度（可选）</span><select id="code-quick-effort" class="form-select">${effortOptions(form.effort)}</select><small class="field-hint">不确定时选「不设置」。只在服务商说明支持时调整 effort。</small></div></div>
+<div class="row-tools"><button class="ghost" type="button" data-action="fetchProviderModels" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">⟳ 从服务获取模型列表</button></div>
+<details class="advanced-compat" data-code-advanced><summary><strong>高级：按角色分别配置模型</strong> · 通常不需要</summary><div class="advanced-compat-body"><p>只有希望为 Opus、Sonnet、Haiku、Fable 和子代理分别指定模型时才使用。展开后保存会使用此处的角色配置，而不是上方推荐配置。</p><div class="model-rows" id="model-rows">${rows}</div><div class="row-tools"><button class="ghost" type="button" data-model-add>＋ 添加模型</button><button class="ghost" type="button" data-action="autoAssignModelRoles" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">✨ 自动分配角色</button></div><template id="model-row-template">${modelRow("", "", false)}</template><div class="detail-section model-section"><div><h3>Claude Code 实际写入预览</h3><p>以下是保存后写入 Claude Code / 终端的 <code>ANTHROPIC_*</code> 与 <code>CLAUDE_CODE_*</code> 环境变量。Desktop 不读取这里的配置。</p></div></div><div class="env-preview" id="env-preview"></div><div class="detail-grid"><div class="detail-item detail-wide"><span class="detail-label">推理强度（effort）</span><select id="model-effort" class="form-select">${effortOptions(form.effort)}</select></div></div></div></details>`;
+  const desktopBody = `<div class="detail-section model-section"><div><h3>三步配置 Desktop</h3><p><strong>1. 服务：</strong>${escapeHtml(provider.name)}（已选择）　<strong>2. 选择模型：</strong>在下方勾选　<strong>3. 保存并重启：</strong>保存后按提示完全退出 Claude Desktop。</p></div></div>
+<div class="detail-section model-section"><div><h3>Desktop 全模型目录</h3><p>这是独立 Claude Desktop 应用的模型选择器，不影响 VS Code 内 Claude Code 或终端。每一行就是实际发给中转站的模型 ID，勾选后由本机代理精确转发。</p></div></div>
+<div class="detail-section model-section"><div><h3>步骤 2：选择模型</h3><p>${routeCount > 0 ? `已启用 ${routeCount} 个模型。高级兼容别名不会参与 Claude Desktop 路由。` : "还未选择模型：先获取模型列表，然后勾选需要的模型。Desktop 与 VS Code 必须在同一台机器，Remote-SSH / WSL 不可用。"}</p></div></div>
+<div class="row-tools"><button class="ghost" type="button" data-action="fetchProviderModels" data-provider-kind="claude" data-provider-id="${escapeHtml(provider.id)}">⟳ 获取模型列表</button><button class="ghost" type="button" data-desktop-routes-all>＋ 添加已缓存的全部模型</button><button class="ghost" type="button" data-desktop-routes-clear>清空全模型目录</button></div>
+<div class="desktop-route-rows" id="desktop-route-rows">${desktopRouteRows}</div>
+${compatSection}`;
+  const isDesktop = surface === "desktop";
+  const heading = isDesktop ? "配置 Claude Desktop 模型" : "配置 Claude Code 模型与参数";
+  const subtitle = isDesktop
+    ? "只影响独立 Claude Desktop 应用。保存后若 Desktop 正在使用此服务，会提示完全退出并重新启动应用。"
+    : "只影响 VS Code 内 Claude Code 与终端 Claude CLI。保存后若 Claude Code 正在使用此服务，会提示重新加载 VS Code。";
+  const action = isDesktop ? "saveClaudeDesktopModels" : "saveClaudeCodeModels";
+  const saveLabel = isDesktop ? "保存 Claude Desktop 模型" : "保存 Claude Code 配置";
+  const saveNote = isDesktop
+    ? (provider.desktopActive ? "Desktop 正在使用此服务，保存后会更新 Desktop 配置；需完全退出并重新启动 Claude Desktop。" : "保存后将在下次切换 Claude Desktop 到此服务时生效。")
+    : (provider.active ? "Claude Code 正在使用此服务，保存后会写入 VS Code 与终端 CLI，并提示重新加载。" : "保存后将在下次切换 Claude Code 到此服务时生效。");
+  const otherAction = isDesktop ? "editClaudeCodeModels" : "editClaudeDesktopModels";
+  const otherLabel = isDesktop ? "去配置 Claude Code 模型" : "去配置 Desktop 模型";
+  return `<article class="card model-form" data-surface="${surface}">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>${heading} — ${escapeHtml(provider.name)}</h2><small class="url">${subtitle}</small></div></div>${notice}${isDesktop ? desktopBody : codeBody}<div class="detail-section"><div><h3>保存</h3><p>${saveNote}</p></div>${actionBar([{ label: saveLabel, action, primary: true }, { label: otherLabel, action: otherAction }, { label: "取消", action: "cancelProviderModelEdit" }], [], target)}</div></article>`;
 }
 
 /**
@@ -940,7 +1061,11 @@ function desktopAliasHint(
   provider: ProviderManagerState["claudeProviders"][number]
 ): string {
   if (!provider.desktopAliasRequired) return "";
-  return `<div class="form-notice" role="note"><span>ℹ</span><span>该服务的模型名不是 Anthropic 系名称，Claude Desktop 会拒绝整份配置。要在桌面应用里使用它，必须在这里填写别名——点“填入标准 Claude 别名”即可，网关会把这些名字映射到自己的模型。</span></div>`;
+  return `<div class="form-notice" role="note"><span>ℹ</span><span>该服务的真实模型名不符合 Claude Desktop 的命名校验。推荐在上方全模型目录勾选模型，由本机代理精确转发。只有服务商文档明确说明它接受某个兼容别名时，才在高级区填写该名称；不要猜测 Claude 的版本号。</span></div>`;
+}
+
+function desktopRouteRow(name: string, supports1m: boolean, selected: boolean): string {
+  return `<label class="desktop-route-row" data-model="${escapeHtml(name)}"><input class="desktop-route-select" type="checkbox"${selected ? " checked" : ""}><span class="desktop-route-name">${escapeHtml(name)}</span><span class="check-row desktop-route-1m" title="该模型在 Desktop 里提供 1M 变体"><input type="checkbox"${supports1m ? " checked" : ""}><span>1M</span></span></label>`;
 }
 
 /** One editable model row: name input, role select, 1M switch, remove button. */
@@ -952,5 +1077,5 @@ function modelRow(name: string, role: string, supports1m: boolean): string {
 
 /** One editable Claude Desktop alias row: name input, 1M switch, remove button. */
 function desktopModelRow(name: string, supports1m: boolean): string {
-  return `<div class="desktop-model-row"><input class="desktop-model-name" type="text" value="${escapeHtml(name)}" placeholder="如 claude-sonnet-5" spellcheck="false" autocomplete="off"><label class="check-row" title="勾选后桌面选择器才会为它提供 1M 上下文变体"><input class="desktop-model-1m" type="checkbox"${supports1m ? " checked" : ""}><span>1M</span></label><button class="icon danger desktop-model-remove" type="button" title="删除此模型名" aria-label="删除此模型名">✕</button></div>`;
+  return `<div class="desktop-model-row"><input class="desktop-model-name" type="text" value="${escapeHtml(name)}" placeholder="服务商明确支持的兼容别名" spellcheck="false" autocomplete="off"><label class="check-row" title="勾选后桌面选择器才会为它提供 1M 上下文变体"><input class="desktop-model-1m" type="checkbox"${supports1m ? " checked" : ""}><span>1M</span></label><button class="icon danger desktop-model-remove" type="button" title="删除此兼容别名" aria-label="删除此兼容别名">✕</button></div>`;
 }

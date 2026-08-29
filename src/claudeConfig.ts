@@ -1,3 +1,5 @@
+import { inferClaudeDesktopTier } from "./claudeDesktop";
+
 export type ClaudeEnvVar = { name: string; value: string };
 export type ClaudeProviderProfile = { id: string; name: string; baseUrl: string };
 export type ClaudeConfigurationCategory = "routing" | "authentication" | "model" | "permission" | "invalid";
@@ -270,6 +272,37 @@ export function createClaudeModelEnvironment(mapping: ClaudeModelMapping): Claud
     entries.push({ name: "CLAUDE_CODE_EFFORT_LEVEL", value: normalized.effortLevel });
   }
   return entries;
+}
+
+/**
+ * The model ID to send upstream when Claude Desktop asks for the given model.
+ *
+ * Claude Desktop rejects any `inferenceModels` entry whose name does not read as
+ * an Anthropic route, so a relay serving `gpt-5.6` is only reachable through a
+ * Claude alias (`claude-opus-5`). The local rewriting proxy intercepts the
+ * request, calls this to translate the alias back to the real model, and
+ * forwards it. The tier is read from the alias itself — exactly how
+ * `buildClaudeDesktopAliasEntries` assigned it — and falls back to the main model
+ * for anything that does not name a tier.
+ */
+export function mapClaudeDesktopModelName(
+  model: string,
+  mapping: ClaudeModelMapping | undefined
+): string {
+  const normalized = normalizeClaudeModelMapping(mapping);
+  if (!normalized) return model;
+  // Upstream APIs do not accept the local `[1m]` capability marker, and the
+  // desktop app may route through an `anthropic/` prefix, so both are shed first.
+  const name = model.trim().replace(/\[1m\]$/i, "").replace(/^anthropic\//i, "").trim();
+  const tier = inferClaudeDesktopTier(name);
+  switch (tier) {
+    case "opus": return normalized.opusModel;
+    case "sonnet": return normalized.sonnetModel;
+    case "haiku": return normalized.haikuModel;
+    case "fable": return normalized.fableModel ?? normalized.mainModel;
+    // `mythos` and every unknown name resolve to the main model.
+    default: return normalized.mainModel;
+  }
 }
 
 export function hasNonClaudeModelIds(modelIds: string[]): boolean {

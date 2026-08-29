@@ -94,6 +94,7 @@ import {
   inspectClaudeSettingsJson,
   isDeepSeekAnthropicApi,
   isClaudeAutoClassifierCompatible,
+  mapClaudeDesktopModelName,
   mergeClaudeJsonEnv,
   normalizeClaudeModelMapping,
   parseClaudeJsonObject,
@@ -102,10 +103,11 @@ import {
   normalizeClaudeProviderBaseUrl,
   stripClaudeProviderSettingsJson
 } from "./claudeConfig";
+import { startClaudeProxy, type ClaudeProxy } from "./claudeProxy";
 import {
   applyClaudeDesktopEntry,
   buildClaudeDesktopGatewayConfig,
-  CLAUDE_DESKTOP_ALIAS_MODELS,
+  CLAUDE_DESKTOP_GENERIC_TIER_ALIASES,
   buildClaudeDesktopAliasEntries,
   buildClaudeDesktopModelEntries,
   isClaudeDesktopCompatibleModel,
@@ -123,9 +125,14 @@ import {
   serializeClaudeDesktopMeta,
   setClaudeDesktopDeploymentMode,
   toClaudeDesktopEntryId,
+  toClaudeDesktopRouteId,
+  buildClaudeDesktopRouteEntries,
+  buildClaudeDesktopRoutes,
+  stripClaudeDesktopRouteSuffix,
   type ClaudeDesktopInstall,
   type ClaudeDesktopLayout,
-  type ClaudeDesktopModelEntry
+  type ClaudeDesktopModelEntry,
+  type ClaudeDesktopRoute
 } from "./claudeDesktop";
 import {
   describeRemoteConfigScope,
@@ -150,6 +157,11 @@ type GatewayProfile = {
   desktopModels?: string[];
   /** Aliases whose desktop entries advertise the 1M-context variant. */
   desktopModel1m?: string[];
+  /**
+   * Explicit per-model Desktop routes. The real IDs are kept here while the
+   * desktop app gets opaque Claude-safe route IDs and the local proxy maps back.
+   */
+  desktopRoutes?: ClaudeDesktopRoute[];
 };
 type GatewayModels = { gatewayId: string; models: string[]; updatedAt: string };
 type CodexProviderProfile = { id: string; name: string; baseUrl: string; usage?: ProviderUsageConfiguration };
@@ -169,6 +181,8 @@ const GATEWAYS_KEY = "aiProviderSwitcher.gateways";
 const GATEWAY_MODELS_KEY = "gatewayModels";
 const CLAUDE_ACTIVE_PROVIDER_KEY = "claudeActiveProviderId";
 const CLAUDE_DESKTOP_ROOT_KEY = "claudeDesktopConfigRoot";
+const CLAUDE_PROXY_PORT_KEY = "claudeProxyPort";
+const CLAUDE_PROXY_DEFAULT_PORT = 4180;
 const CLAUDE_USER_SETTINGS_FILE = path.join(os.homedir(), ".claude", "settings.json");
 const CODEX_SECRET_KEY_PREFIX = "aiProviderSwitcher.codex.apiKey.";
 const CODEX_PROVIDERS_KEY = "codexProviders";
@@ -296,7 +310,13 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  void refreshStatusBar();
+  // The proxy resolver reads the desktop snapshot. Refresh it first so a Desktop
+  // already configured to use 127.0.0.1 cannot send its first request during
+  // activation before the entry id has identified its provider.
+  void (async () => {
+    await refreshStatusBar();
+    await startClaudeProxyForExtension(context);
+  })();
 
   // Retry a deferred unified-history migration (e.g. it was skipped because the
   // live config was not yet routed to the shared bucket). Best effort only.
@@ -385,7 +405,7 @@ async function quickSwitchCodex(context: vscode.ExtensionContext): Promise<void>
 
 function openProviderManager(
   context: vscode.ExtensionContext,
-  focus?: { kind: "claude" | "codex"; id: string; edit?: boolean }
+  focus?: { kind: "claude" | "codex"; id: string; edit?: boolean; modelSurface?: "code" | "desktop" }
 ): void {
   // The desktop state lives on disk, so the first paint uses the last snapshot
   // and a fresh read re-paints the panel as soon as it resolves.
@@ -438,6 +458,8 @@ function getProviderManagerState(): ProviderManagerState {
       // editor and saving add CLAUDE_CODE_EFFORT_LEVEL to a provider that had none.
       effortLevel: provider.modelMapping?.effortLevel ?? "",
       desktopModels: desktopAliasRows(provider),
+      desktopRoutes: desktopRouteRows(provider),
+      desktopActive: claudeDesktopSnapshot.providerId === provider.id,
       desktopAliasRequired: desktopAliasRequired(provider)
     })),
     codexMode: getCodexModeLabel(),
@@ -490,6 +512,15 @@ function desktopAliasRows(gateway: GatewayProfile): Array<{ name: string; suppor
   const aliases = gateway.desktopModels ?? [];
   const oneM = desktopAlias1mFor(gateway);
   return aliases.map((name) => ({ name, supports1m: oneM(name) }));
+}
+
+/** Explicit proxy catalogue rows, normalized back to the cached model list. */
+function desktopRouteRows(gateway: GatewayProfile): Array<{ name: string; supports1m: boolean }> {
+  const cached = getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? [];
+  const cachedSet = new Set(cached);
+  return (gateway.desktopRoutes ?? [])
+    .filter((route) => cachedSet.has(route.model))
+    .map((route) => ({ name: route.model, supports1m: route.supports1m === true }));
 }
 
 /** The gateway's alias 1M rule, shared by the editor rows and the written config. */
@@ -599,7 +630,7 @@ async function fetchProviderModelsIntoForm(
   };
 }
 
-async function saveClaudeProviderModels(
+async function saveClaudeCodeModels(
   context: vscode.ExtensionContext,
   gatewayId: string,
   form: ProviderModelFormPayload
@@ -617,62 +648,97 @@ async function saveClaudeProviderModels(
     names.push(name);
   }
   if (names.length === 0) {
-    return { keepEditing: true, message: "请至少填写一个模型 ID。" };
+    return { keepEditing: true, modelForm: { ...form, surface: "code" }, message: "请至少填写一个模型 ID。" };
   }
-  // The first row claiming a role wins; the form says so.
   const pick = (role: string): string | undefined =>
     form.models.find((item) => item.role === role && item.name.trim())?.name.trim();
-  // Every model row with a checked 1M switch is declared long-context, whatever
-  // role it plays — including none, so an unmapped model keeps its switch.
   const longContextModels = names.filter((name) =>
     form.models.some((item) => item.name.trim() === name && item.supports1m)
   );
   const mapping = normalizeClaudeModelMapping({
-    mainModel: pick("main"),
-    opusModel: pick("opus"),
-    sonnetModel: pick("sonnet"),
-    haikuModel: pick("haiku"),
-    fableModel: pick("fable"),
-    subagentModel: pick("subagent"),
-    effortLevel: form.effort,
-    longContextModels
+    mainModel: pick("main"), opusModel: pick("opus"), sonnetModel: pick("sonnet"),
+    haikuModel: pick("haiku"), fableModel: pick("fable"), subagentModel: pick("subagent"),
+    effortLevel: form.effort, longContextModels
   });
-  // Without a main model the mapping cannot be built, and saving it would wipe
-  // every role and 1M switch already stored. Keep the form open and say so.
   if (!mapping) {
     return {
       keepEditing: true,
-      message: "请先把其中一个模型的角色设为“主模型”，其余角色可留空（会回落到主模型）。"
+      modelForm: { ...form, surface: "code" },
+      message: "请先把其中一个模型设为“主模型”，其余角色可留空（会回落到主模型）。"
     };
   }
+  await saveGatewayModels(gateway.id, names);
+  // This editor owns only the Claude Code mapping. Desktop routes and aliases
+  // are deliberately copied from the stored provider so a Code save cannot
+  // silently replace a Desktop catalogue the user configured separately.
+  const updated: GatewayProfile = { ...gateway, modelMapping: mapping };
+  await updateGatewayProfile(updated);
+  const notes = await applyClaudeCodeModelChange(context, updated, mapping);
+  if (duplicates.length > 0) notes.unshift(`已跳过重复模型：${duplicates.join("、")}`);
+  vscode.window.showInformationMessage([`已保存“${gateway.name}”的 Claude Code 模型与参数。`, ...notes].join(" "));
+  return undefined;
+}
+
+async function saveClaudeDesktopModels(
+  context: vscode.ExtensionContext,
+  gatewayId: string,
+  form: ProviderModelFormPayload
+): Promise<ProviderManagerActionResult | void> {
+  const gateway = getGateways().find((item) => item.id === gatewayId);
+  if (!gateway) return undefined;
+  const cached = new Set(getGatewayModels().find((entry) => entry.gatewayId === gateway.id)?.models ?? []);
+  const desktopRoutes = buildClaudeDesktopRoutes(
+    gateway.id,
+    (form.desktopRoutes ?? []).filter((row) => cached.has(row.name.trim()))
+  );
   const desktopNames: string[] = [];
   const desktop1m: string[] = [];
-  const rejectedDesktop: string[] = [];
-  for (const row of form.desktopModels) {
+  const rejected: string[] = [];
+  for (const row of form.desktopModels ?? []) {
     const name = row.name.trim();
     if (!name || desktopNames.includes(name)) continue;
-    if (!isClaudeDesktopCompatibleModel(name)) { rejectedDesktop.push(name); continue; }
+    if (!isClaudeDesktopCompatibleModel(name)) { rejected.push(name); continue; }
     desktopNames.push(name);
     if (row.supports1m) desktop1m.push(name);
   }
-  await saveGatewayModels(gateway.id, names);
+  if (desktopRoutes.length === 0 && desktopNames.length === 0) {
+    return {
+      keepEditing: true,
+      modelForm: { ...form, surface: "desktop" },
+      message: "请至少在全模型目录勾选一个模型，或在高级兼容别名中填写服务商明确支持的名称。"
+    };
+  }
+  // Desktop configuration is independent: never save the role mapping, effort,
+  // or CLI 1M declarations from the form submitted by this page.
   const updated: GatewayProfile = {
     ...gateway,
-    modelMapping: mapping,
+    desktopRoutes: desktopRoutes.length > 0 ? desktopRoutes : undefined,
     desktopModels: desktopNames.length > 0 ? desktopNames : undefined,
-    // An empty list is a decision, not an absence: it is what lets the default
-    // alias's 1M switch stay off. Only a gateway with no aliases at all is
-    // stored as `undefined`, which is the "never configured" seed state.
     desktopModel1m: desktopNames.length > 0 ? desktop1m : undefined
   };
   await updateGatewayProfile(updated);
-
   const notes: string[] = [];
-  if (duplicates.length > 0) notes.push(`已跳过重复模型：${duplicates.join("、")}`);
-  if (rejectedDesktop.length > 0) notes.push(`Claude Desktop 不接受这些模型名，已跳过：${rejectedDesktop.join("、")}`);
-  notes.push(...await applyClaudeProviderModelChange(context, updated, mapping));
-  vscode.window.showInformationMessage([`已保存“${gateway.name}”的 ${names.length} 个模型与参数。`, ...notes].join(" "));
+  if (rejected.length > 0) notes.push(`已跳过 Desktop 不接受的兼容别名：${rejected.join("、")}`);
+  if (claudeDesktopSnapshot.providerId === gateway.id) {
+    notes.push(await applyClaudeDesktopModelChange(context, updated));
+  } else {
+    notes.push("该服务尚未被 Claude Desktop 使用；下次切换 Desktop 服务时会带入此目录。");
+  }
+  vscode.window.showInformationMessage([`已保存“${gateway.name}”的 Claude Desktop 模型。`, ...notes].join(" "));
   return undefined;
+}
+
+/** Backward-compatible handler for an older webview: save both old surfaces. */
+async function saveClaudeProviderModels(
+  context: vscode.ExtensionContext,
+  gatewayId: string,
+  form: ProviderModelFormPayload
+): Promise<ProviderManagerActionResult | void> {
+  // Old panels used one Save button. Preserve the previous broad behavior only
+  // there; the current UI calls one of the two surface-specific functions.
+  const code = await saveClaudeCodeModels(context, gatewayId, { ...form, surface: "code" });
+  if (code?.keepEditing) return code;
+  return saveClaudeDesktopModels(context, gatewayId, { ...form, surface: "desktop" });
 }
 
 /**
@@ -682,6 +748,35 @@ async function saveClaudeProviderModels(
  * running the previous models while the panel reported success. Returns the
  * notes to append to the save message; a failure degrades to a note rather than
  * failing the save, since the configuration itself is already stored.
+ */
+async function applyClaudeCodeModelChange(
+  context: vscode.ExtensionContext,
+  gateway: GatewayProfile,
+  mapping: ClaudeModelMapping
+): Promise<string[]> {
+  const notes: string[] = [];
+  if (getCurrentClaudeProvider()?.id === gateway.id) {
+    try {
+      const applied = [
+        ...removeClaudeModelEnvironment(getClaudeEnvVars()),
+        ...createClaudeModelEnvironment(mapping)
+      ];
+      await updateClaudeEnvVars(applied);
+      await syncClaudeUserSettingsEnv(applied);
+      notes.push("已应用到 VS Code 与终端 CLI。");
+    } catch (error) {
+      notes.push(`应用到 VS Code / CLI 失败：${errorText(error)}`);
+    }
+  }
+  if (notes.some((note) => note.startsWith("已应用到 VS Code"))) {
+    await offerReload(`已保存并应用“${gateway.name}”的 Claude Code 模型配置。需要重新加载 VS Code 才会生效，是否立即重载？`);
+  }
+  return notes;
+}
+
+/**
+ * Legacy combined apply helper. New UI calls the Code or Desktop path explicitly
+ * so an edit in one product cannot silently rewrite the other product's config.
  */
 async function applyClaudeProviderModelChange(
   context: vscode.ExtensionContext,
@@ -770,6 +865,26 @@ async function handleProviderManagerAction(
   const targeted = message.providerKind && message.providerId
     ? getUsageProviderById(message.providerKind, message.providerId)
     : undefined;
+  if (action === "configureCurrentClaudeCodeModels") {
+    const current = getCurrentClaudeProvider();
+    if (!current) {
+      vscode.window.showInformationMessage("Claude Code 当前使用官方订阅。请先切换到一个中转站，再配置它的 Claude Code 模型。");
+      return;
+    }
+    openProviderManager(context, { kind: "claude", id: current.id, modelSurface: "code" });
+    return;
+  }
+  if (action === "configureCurrentClaudeDesktopModels") {
+    const current = claudeDesktopSnapshot.providerId
+      ? getGateways().find((gateway) => gateway.id === claudeDesktopSnapshot.providerId)
+      : undefined;
+    if (!current) {
+      vscode.window.showInformationMessage("Claude Desktop 当前使用官方或未识别的服务。请先切换 Claude Desktop 服务，再配置它的模型目录。");
+      return;
+    }
+    openProviderManager(context, { kind: "claude", id: current.id, modelSurface: "desktop" });
+    return;
+  }
   if (action === "saveProviderEdit") {
     if (!message.providerKind || !message.providerId || !message.draft) {
       return { keepEditing: true, message: "表单数据不完整，请重试。" };
@@ -779,7 +894,14 @@ async function handleProviderManagerAction(
       : saveCodexProviderEdit(context, message.providerId, message.draft);
   }
   if (action === "saveProviderModels" && message.providerId && message.modelForm) {
+    // Compatibility for a stale webview from an older extension build.
     return saveClaudeProviderModels(context, message.providerId, message.modelForm);
+  }
+  if (action === "saveClaudeCodeModels" && message.providerId && message.modelForm) {
+    return saveClaudeCodeModels(context, message.providerId, message.modelForm);
+  }
+  if (action === "saveClaudeDesktopModels" && message.providerId && message.modelForm) {
+    return saveClaudeDesktopModels(context, message.providerId, message.modelForm);
   }
   if (action === "autoAssignModelRoles" && message.providerId && message.modelForm) {
     return autoAssignProviderModelRoles(message.modelForm);
@@ -1528,6 +1650,86 @@ let claudeDesktopSnapshot: { label: string; official: boolean; providerId?: stri
 };
 
 /**
+ * The local rewriting proxy for Claude Desktop. Started in `activate` and stopped
+ * in `deactivate`; it lives inside the extension host, so a reload restarts it.
+ * Only the desktop app routes through it — Claude Code and VS Code already send
+ * the real model name straight to the relay, so they have nothing to rewrite.
+ */
+let claudeProxy: ClaudeProxy | undefined;
+
+/** Where the desktop app should point when it needs the rewrite proxy. */
+function claudeProxyUrl(): string | undefined {
+  return claudeProxy ? `http://127.0.0.1:${claudeProxy.port}` : undefined;
+}
+
+/**
+ * A provider needs the rewrite proxy exactly when its real models are not
+ * Anthropic names — the situation that forces the Claude aliases. A native
+ * Anthropic relay keeps the direct path, so existing setups behave unchanged.
+ */
+function claudeDesktopNeedsModelRewrite(gateway: GatewayProfile): boolean {
+  // A catalogue route is always an opaque desktop-only alias, even when the
+  // upstream model happens to be Claude-shaped, so it always needs the proxy.
+  if (gateway.desktopRoutes?.length) return true;
+  const mapping = normalizeClaudeModelMapping(gateway.modelMapping);
+  if (!mapping) return false;
+  return !isClaudeDesktopCompatibleModel(mapping.mainModel);
+}
+
+/** Resolves the model the proxy must rewrite, for the live desktop provider. */
+function resolveClaudeDesktopProxyTarget(model: string): { baseUrl: string; model: string } | undefined {
+  const providerId = claudeDesktopSnapshot.providerId;
+  if (!providerId) return undefined;
+  const provider = getGateways().find((item) => item.id === providerId);
+  if (!provider) return undefined;
+  const routeId = stripClaudeDesktopRouteSuffix(model);
+  const route = provider.desktopRoutes?.find((item) => item.routeId === routeId);
+  if (route) return { baseUrl: provider.baseUrl, model: route.model };
+  // Legacy / simple-proxy route: standard Claude aliases map through the
+  // provider's role mapping. Once an explicit catalogue is configured, unknown
+  // routes are rejected rather than being silently sent to the wrong model.
+  if (provider.desktopRoutes?.length) return undefined;
+  const mapping = normalizeClaudeModelMapping(provider.modelMapping);
+  if (!mapping) return undefined;
+  return { baseUrl: provider.baseUrl, model: mapClaudeDesktopModelName(model, mapping) };
+}
+
+/**
+ * Starts the rewriting proxy on the configured port and stops it when the
+ * extension unloads. Failure degrades to a warning: the proxy is only required
+ * for non-Anthropic relays, and the switch path reports its absence when it
+ * matters.
+ */
+async function startClaudeProxyForExtension(context: vscode.ExtensionContext): Promise<void> {
+  try {
+    const configured = vscode.workspace
+      .getConfiguration("aiProviderSwitcher")
+      .get<number>(CLAUDE_PROXY_PORT_KEY, CLAUDE_PROXY_DEFAULT_PORT);
+    const port = typeof configured === "number" && configured >= 1024 && configured <= 65535
+      ? configured
+      : CLAUDE_PROXY_DEFAULT_PORT;
+    const proxy = await startClaudeProxy({ port, resolve: resolveClaudeDesktopProxyTarget });
+    claudeProxy = proxy;
+    if (proxy.bindWarning) {
+      vscode.window.showWarningMessage(
+        `Claude Desktop 本地改写代理：${proxy.bindWarning}若已切换过桌面端，请重新执行“切换 Claude Desktop 服务”。`
+      );
+    }
+    context.subscriptions.push({
+      dispose() {
+        proxy.stop();
+        if (claudeProxy === proxy) claudeProxy = undefined;
+      }
+    });
+  } catch (error) {
+    claudeProxy = undefined;
+    vscode.window.showWarningMessage(
+      `Claude Desktop 本地改写代理启动失败：${error instanceof Error ? error.message : "未知错误"}`
+    );
+  }
+}
+
+/**
  * How to actually quit Claude Desktop, in the terms of the platform the user is
  * on. "Fully quit" is not the same gesture everywhere — closing the window keeps
  * the app alive in the Windows tray and in the macOS dock — and the config is
@@ -1653,6 +1855,9 @@ function getClaudeDesktopModelEntries(gateway: GatewayProfile): {
   rejected: string[];
 } {
   const mapping = normalizeClaudeModelMapping(gateway.modelMapping);
+  if (gateway.desktopRoutes?.length) {
+    return { entries: buildClaudeDesktopRouteEntries(gateway.desktopRoutes, gateway.name), rejected: [] };
+  }
   if (gateway.desktopModels?.length) {
     // The alias path also carries the 1M claims, otherwise a gateway reached
     // through aliases (DeepSeek) never gets the context option even when its
@@ -1688,6 +1893,17 @@ async function applyClaudeDesktopGateway(
   token: string,
   models: ClaudeDesktopModelEntry[]
 ): Promise<void> {
+  // A relay whose real models are not Anthropic names has to be reached through
+  // the local rewriting proxy; pointing the config at a proxy that is not running
+  // would leave the desktop app talking to a dead port, so that is an error.
+  let baseUrl = gateway.baseUrl;
+  if (claudeDesktopNeedsModelRewrite(gateway)) {
+    const proxyUrl = claudeProxyUrl();
+    if (!proxyUrl) {
+      throw new Error("需要本地改写代理才能使用该中转站的模型，但代理未启动。请重新加载 VS Code 后重试。");
+    }
+    baseUrl = proxyUrl;
+  }
   const entryId = toClaudeDesktopEntryId(gateway.id);
   const entry = { id: entryId, name: gateway.name };
   for (const layout of await getClaudeDesktopLibraryLayouts(install)) {
@@ -1700,7 +1916,7 @@ async function applyClaudeDesktopGateway(
       entryFile,
       buildClaudeDesktopGatewayConfig(
         await readOptionalFile(entryFile),
-        { baseUrl: gateway.baseUrl, apiKey: token, models },
+        { baseUrl, apiKey: token, models },
         inherited
       )
     );
@@ -1892,16 +2108,12 @@ async function confirmClaudeDesktopModels(
     ? `“${gateway.name}”的模型（${rejected.join("、")}）不是 Anthropic 系名称，Claude Desktop 会拒绝整份配置。`
     : `还没有缓存“${gateway.name}”的模型列表，而该网关多半不提供 /v1/models，桌面应用将无法列出任何模型。`;
   const choice = await vscode.window.showWarningMessage(
-    `${detail}\n\n桌面应用只接受名称中含 claude/opus/sonnet/haiku/anthropic 的模型 ID。若该网关本身能识别 Claude 模型名（DeepSeek 等 Anthropic 兼容端点都可以），可以改用标准 Claude 名称接入。`,
+    `${detail}\n\n推荐先刷新模型列表，然后在“模型与参数 → Claude Desktop 模型 → 全模型目录”勾选实际模型；这是无需猜测别名、可精确转发的方式。若服务商文档明确要求某个兼容别名，才选择手动填写。`,
     { modal: true },
-    "使用标准 Claude 模型名",
-    "手动填写模型名",
-    "刷新模型列表"
+    "刷新模型列表",
+    "手动填写服务商兼容别名"
   );
-  if (choice === "使用标准 Claude 模型名") {
-    return applyClaudeDesktopAliases(gateway, [...CLAUDE_DESKTOP_ALIAS_MODELS]);
-  }
-  if (choice === "手动填写模型名") {
+  if (choice === "手动填写服务商兼容别名") {
     const names = await promptClaudeDesktopAliases(gateway);
     return names ? applyClaudeDesktopAliases(gateway, names) : false;
   }
@@ -1965,9 +2177,9 @@ async function saveGatewayDesktopModels(gatewayId: string, names: string[]): Pro
 
 async function promptClaudeDesktopAliases(gateway: GatewayProfile): Promise<string[] | undefined> {
   const value = await vscode.window.showInputBox({
-    title: `Claude Desktop 模型名 — ${gateway.name}`,
-    prompt: "用逗号分隔。这些名称会原样发给网关，由网关自行路由到它真正的模型。",
-    value: (gateway.desktopModels ?? [...CLAUDE_DESKTOP_ALIAS_MODELS]).join(", "),
+    title: `Claude Desktop 服务商兼容别名 — ${gateway.name}`,
+    prompt: "用逗号分隔。这些名称会原样发给网关；仅填写服务商文档明确支持的名称，不要猜测 Claude 模型版本。",
+    value: (gateway.desktopModels ?? CLAUDE_DESKTOP_GENERIC_TIER_ALIASES).join(", "),
     validateInput: (input) => {
       const names = input.split(/[,，]/).map((name) => name.trim()).filter(Boolean);
       if (names.length === 0) return "请至少填写一个模型名";
@@ -1984,15 +2196,15 @@ async function configureClaudeDesktopModels(gateway?: GatewayProfile): Promise<v
   const target = gateway ?? (await pickGateway());
   if (!target) return;
   const current = target.desktopModels?.length
-    ? `当前：${target.desktopModels.join("、")}`
-    : "当前：自动使用刷新到的模型列表";
+    ? `当前高级兼容别名：${target.desktopModels.join("、")}`
+    : "当前：未配置兼容别名（推荐使用全模型目录）";
   const choice = await vscode.window.showQuickPick(
     [
-      { label: "使用标准 Claude 模型名", description: CLAUDE_DESKTOP_ALIAS_MODELS.join("、") },
-      { label: "手动填写模型名", description: "自行指定要发给网关的 Claude 系名称" },
-      { label: "恢复自动发现", description: "改回使用该网关刷新到的真实模型列表" }
+      { label: "填写服务商兼容别名", description: "仅填写服务商文档明确支持、会原样发给网关的名称" },
+      { label: "填入通用档位名（需服务商支持）", description: CLAUDE_DESKTOP_GENERIC_TIER_ALIASES.join("、") },
+      { label: "恢复自动发现", description: "删除兼容别名；优先改用全模型目录" }
     ],
-    { title: `Claude Desktop 模型名 — ${target.name}`, placeHolder: current }
+    { title: `Claude Desktop 高级兼容别名 — ${target.name}`, placeHolder: current }
   );
   if (!choice) return;
   if (choice.label === "恢复自动发现") {
@@ -2002,8 +2214,8 @@ async function configureClaudeDesktopModels(gateway?: GatewayProfile): Promise<v
     );
     return;
   }
-  const names = choice.label === "使用标准 Claude 模型名"
-    ? [...CLAUDE_DESKTOP_ALIAS_MODELS]
+  const names = choice.label === "填入通用档位名（需服务商支持）"
+    ? [...CLAUDE_DESKTOP_GENERIC_TIER_ALIASES]
     : await promptClaudeDesktopAliases(target);
   if (!names) return;
   if (!(await applyClaudeDesktopAliases(target, names))) return;
@@ -4770,6 +4982,25 @@ function normalizeDesktopModelNames(raw: unknown): string[] | undefined {
   return names.length > 0 ? [...new Set(names)] : undefined;
 }
 
+/** Reads only well-formed, self-consistent catalogue routes from stored settings. */
+function normalizeDesktopRoutes(raw: unknown, providerId: string): ClaudeDesktopRoute[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const seen = new Set<string>();
+  const routes: ClaudeDesktopRoute[] = [];
+  for (const item of raw) {
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as Record<string, unknown>;
+    const model = String(record.model ?? "").trim();
+    const routeId = String(record.routeId ?? "").trim();
+    // The route ID is derived rather than trusted, preventing a hand-edited
+    // settings entry from sending a Desktop request to a different model.
+    if (!model || routeId !== toClaudeDesktopRouteId(providerId, model) || seen.has(model)) continue;
+    seen.add(model);
+    routes.push({ routeId, model, supports1m: record.supports1m === true });
+  }
+  return routes.length > 0 ? routes : undefined;
+}
+
 function getGateways(): GatewayProfile[] {
   const settings = vscode.workspace.getConfiguration("aiProviderSwitcher");
   const raw = settings.get<unknown>("gateways", []);
@@ -4778,8 +5009,9 @@ function getGateways(): GatewayProfile[] {
     .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
     .map((item) => {
       const baseUrl = normalizeClaudeProviderBaseUrl(String(item.baseUrl ?? ""));
+      const id = String(item.id ?? "").trim();
       return {
-        id: String(item.id ?? "").trim(),
+        id,
         name: String(item.name ?? "").trim(),
         baseUrl,
         modelMapping: normalizeClaudeModelMapping(item.modelMapping) ??
@@ -4787,7 +5019,8 @@ function getGateways(): GatewayProfile[] {
         permissionStrategy: normalizeClaudePermissionStrategy(item.permissionStrategy),
         usage: normalizeUsageConfiguration(item.usage),
         desktopModels: normalizeDesktopModelNames(item.desktopModels),
-        desktopModel1m: normalizeDesktopModelNames(item.desktopModel1m)
+        desktopModel1m: normalizeDesktopModelNames(item.desktopModel1m),
+        desktopRoutes: normalizeDesktopRoutes(item.desktopRoutes, id)
       };
     })
     .filter((gateway) => gateway.id && gateway.name && gateway.baseUrl);

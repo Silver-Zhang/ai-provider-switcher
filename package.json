@@ -2,7 +2,7 @@
   "name": "ai-provider-switcher",
   "displayName": "AI Provider Switcher",
   "description": "Manage and switch Claude Code and Codex official providers, gateways, and models.",
-  "version": "0.5.5",
+  "version": "0.6.0",
   "publisher": "silver-zhang",
   "repository": {
     "type": "git",
@@ -222,6 +222,19 @@
                   "type": "string"
                 }
               },
+              "desktopRoutes": {
+                "type": "array",
+                "description": "Explicit per-model Claude Desktop catalogue routes. The desktop app receives opaque Claude-safe route IDs; the extension's local proxy resolves each route back to this exact upstream model.",
+                "items": {
+                  "type": "object",
+                  "required": ["routeId", "model"],
+                  "properties": {
+                    "routeId": { "type": "string" },
+                    "model": { "type": "string" },
+                    "supports1m": { "type": "boolean" }
+                  }
+                }
+              },
               "modelMapping": {
                 "type": "object",
                 "description": "Optional mapping from Claude model families and agents to model IDs accepted by this Anthropic-compatible provider.",
@@ -345,6 +358,13 @@
           "type": "string",
           "default": "",
           "description": "Claude Desktop data directory (the folder containing claude_desktop_config.json), e.g. %LOCALAPPDATA%\\Claude on Windows or ~/Library/Application Support/Claude on macOS. Leave empty to auto-detect; set it when the app is installed somewhere non-standard. The desktop app is managed independently through its third-party inference config library and only picks up changes after a full restart."
+        },
+        "aiProviderSwitcher.claudeProxyPort": {
+          "type": "number",
+          "default": 4180,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Local port for the Claude Desktop model-name rewriting proxy. Non-Anthropic relays (e.g. gpt-*) reach Claude Desktop through Claude aliases, and this proxy rewrites those aliases back to the real model before forwarding. Leave at the default unless 4180 is in use."
         },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",

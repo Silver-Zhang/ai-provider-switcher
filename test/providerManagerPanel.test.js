@@ -68,6 +68,7 @@ const STATE = {
       ],
       effortLevel: "high",
       desktopModels: [{ name: "claude-sonnet-5", supports1m: false }],
+      desktopRoutes: [],
       desktopAliasRequired: true
     },
     {
@@ -84,6 +85,7 @@ const STATE = {
       // "auto", which is a value that does get written.
       effortLevel: "",
       desktopModels: [],
+      desktopRoutes: [],
       desktopAliasRequired: false
     }
   ],
@@ -174,7 +176,7 @@ test("each action group has exactly one filled button and an overflow menu", () 
   for (const group of detail.split('<div class="actions">').slice(1)) {
     assert.equal((group.match(/<button class=""/g) ?? []).length, 1);
   }
-  assert.equal((detail.match(/<details class="overflow">/g) ?? []).length, 2);
+  assert.equal((detail.match(/<details class="overflow">/g) ?? []).length, 3);
   assert.match(detail, /data-action="inspectClaude"/);
   assert.match(detail, /data-action="configureCodexProxy"/);
 });
@@ -286,7 +288,7 @@ test("a selection that no longer resolves falls back to the overview", async () 
   onAction = async () => undefined;
   open({ kind: "claude", id: "deleted-provider" });
   // The state has no such provider, so the detail pane must not be left blank or stale.
-  assert.match(latest().detail, /<h2>Claude<\/h2>/);
+  assert.match(latest().detail, /<h2>服务库<\/h2>/);
   assert.doesNotMatch(latest().list, /class="provider selected" draggable/);
 });
 
@@ -307,10 +309,60 @@ test("the model editor renders each model with its role and 1M state", async () 
   // The editor offers both the fetch and the auto-assign actions in place.
   assert.match(detail, /data-action="fetchProviderModels"/);
   assert.match(detail, /data-action="autoAssignModelRoles"/);
-  assert.match(detail, /data-desktop-standard=/);
-  // A gateway whose own names Desktop refuses says so at configuration time.
-  assert.match(detail, /Claude Desktop 会拒绝整份配置/);
-  assert.match(detail, /id="env-preview"/);
+  // The old generic model-editor action is now the backwards-compatible Claude
+  // Code page; it deliberately does not leak Desktop catalogue or aliases.
+  assert.match(detail, /data-surface="code"/);
+  assert.match(detail, /配置 Claude Code 模型与参数/);
+  assert.match(detail, /Claude Code 实际写入预览/);
+  assert.match(detail, /saveClaudeCodeModels/);
+  assert.doesNotMatch(detail, /Claude Desktop 全模型目录/);
+  assert.doesNotMatch(detail, /高级：旧版兼容别名/);
+});
+
+test("the Desktop editor is isolated from the Claude Code mapping", async () => {
+  onAction = async () => undefined;
+  open();
+  await receive({ action: "editClaudeDesktopModels", providerKind: "claude", providerId: "relay-a" });
+  const { detail } = latest();
+  assert.match(detail, /data-surface="desktop"/);
+  assert.match(detail, /配置 Claude Desktop 模型/);
+  assert.match(detail, /Desktop 全模型目录/);
+  assert.match(detail, /data-desktop-routes-all/);
+  assert.match(detail, /高级：旧版兼容别名/);
+  assert.match(detail, /<details class="advanced-compat" open>/);
+  assert.match(detail, /检测到旧版别名配置，当前正在使用兼容模式/);
+  assert.match(detail, /saveClaudeDesktopModels/);
+  assert.doesNotMatch(detail, /Claude Code 实际写入预览/);
+  assert.doesNotMatch(detail, /推理强度（effort）/);
+  assert.doesNotMatch(detail, /data-action="autoAssignModelRoles"/);
+});
+
+test("overview separates Claude Code and Desktop actions", () => {
+  const { detail } = open();
+  assert.match(detail, /Claude Code（VS Code \/ 终端）/);
+  assert.match(detail, /Claude Desktop（独立应用）/);
+  assert.match(detail, /data-action="configureCurrentClaudeCodeModels"/);
+  assert.match(detail, /data-action="configureCurrentClaudeDesktopModels"/);
+  assert.match(detail, /不会切换 Claude Desktop/);
+  assert.match(detail, /独立于 VS Code 和终端/);
+});
+
+test("surface-specific saves forward the form with its surface", async () => {
+  const sent = [];
+  onAction = async (message) => { sent.push(message); return undefined; };
+  open();
+  await receive({
+    action: "saveClaudeCodeModels", providerKind: "claude", providerId: "relay-a",
+    modelForm: { models: [], effort: "", desktopModels: [], desktopRoutes: [], surface: "code" }
+  });
+  await receive({
+    action: "editClaudeDesktopModels", providerKind: "claude", providerId: "relay-a" });
+  await receive({
+    action: "saveClaudeDesktopModels", providerKind: "claude", providerId: "relay-a",
+    modelForm: { models: [], effort: "", desktopModels: [], desktopRoutes: [], surface: "desktop" }
+  });
+  assert.equal(sent[0].modelForm.surface, "code");
+  assert.equal(sent[1].modelForm.surface, "desktop");
 });
 
 test("a host-recomputed draft replaces what the form submitted", async () => {
@@ -320,7 +372,8 @@ test("a host-recomputed draft replaces what the form submitted", async () => {
       { name: "deepseek-v4-flash", role: "haiku", supports1m: false }
     ],
     effort: "high",
-    desktopModels: []
+    desktopModels: [],
+    desktopRoutes: []
   };
   onAction = async () => ({ keepEditing: true, modelForm: assigned, message: "已按模型名分配" });
   open();
@@ -337,7 +390,8 @@ test("a host-recomputed draft replaces what the form submitted", async () => {
         { name: "deepseek-v4-flash", role: "", supports1m: false }
       ],
       effort: "high",
-      desktopModels: []
+      desktopModels: [],
+      desktopRoutes: []
     }
   });
   const { detail } = latest();

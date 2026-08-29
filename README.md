@@ -169,17 +169,28 @@ Windows PowerShell 如果阻止 `npm.ps1`，可改用 `npm.cmd install` 和 `npm
 
 ## Claude 使用指南
 
-### 切换到 Claude 自定义 Provider
+### 配置 Claude Code（VS Code / 终端）
 
-1. 打开管理器，在 Claude 卡片中点击“管理服务”。
-2. 选择“添加中转站”。
-3. 输入名称和服务根地址。通常不要在结尾填写 `/v1`。
-4. 选择“快速切换”，选中新 Provider。
-5. 首次使用时输入 Token。输入内容不会显示。
-6. 根据提示处理可能覆盖路由、认证或模型的外部配置。
-7. 如果 Provider 使用非 Claude 模型 ID，按引导配置模型映射。
-8. 选择命令执行策略。
-9. 重新加载 VS Code，并创建一个新 Claude 会话。
+这条流程只影响 VS Code 内的 Claude Code 和终端 `claude`，**不会改变 Claude Desktop**：
+
+1. 打开管理器；在总览中选择 **Claude Code（VS Code / 终端）→ 切换 Claude Code 服务**。
+2. 没有服务时，点左侧 Claude 区的 **＋** 添加中转站；填写名称、服务根地址与 Token。通常不要在 URL 末尾填写 `/v1`。
+3. 在该服务详情的 **Claude Code（VS Code / 终端）** 区，点 **配置 Claude Code 模型**。
+4. 点 **从服务获取模型列表**；若服务提供非 Claude 模型 ID，可点 **自动分配角色**，再按需要调整主模型、快速模型和 1M。
+5. 点 **保存 Claude Code 配置**。若该服务正在使用，扩展会写入 VS Code 与终端 CLI，并提示重新加载 VS Code；随后新建 Claude 会话。
+6. 命令策略也只属于 Claude Code / CLI，在该服务详情的 **命令策略** 中配置。
+
+### 配置 Claude Desktop（独立应用）
+
+这条流程只影响 Claude Desktop，**不会改变 VS Code 内 Claude Code 或终端 CLI**：
+
+1. 在总览选择 **Claude Desktop（独立应用）→ 切换 Claude Desktop 服务**，选择要使用的中转站。
+2. 在该服务详情的 **Claude Desktop（独立应用）** 区，点 **配置 Desktop 模型**。
+3. 在 **全模型目录** 点 **添加已缓存的全部模型**，或只勾选需要的真实模型。对于 GPT、Claude 混合中转站，这是推荐方式。
+4. 点 **保存 Claude Desktop 模型**。只有 Desktop 正在使用此服务时会立即改写 Desktop 配置；否则会在下一次切换到该服务时带入。
+5. 按平台提示**完全退出** Claude Desktop 再重新打开（关闭窗口通常不等于退出）。
+
+> 「高级：旧版兼容别名」只给已存在的旧配置或服务商明确要求某个别名的情况使用；新用户不需要配置它。
 
 ### 恢复 Claude 官方订阅
 
@@ -198,9 +209,10 @@ Windows PowerShell 如果阻止 `npm.ps1`，可改用 `npm.cmd install` 和 `npm
   - 面板上显示的桌面状态直接读自磁盘，因此你在应用内或用其他工具改过的配置也会如实反映。
   - 切换时会把该中转站已缓存的模型写进配置条目的 `inferenceModels`，桌面应用便不再自行探测模型列表。多数中转站不提供该探测接口（返回 404），这正是模型选择器为空、发消息报 `Your organization's model list hasn't loaded yet` 的原因；先**刷新模型列表**再切换即可。你为该中转站配置的模型映射会一并带过去（写成每个条目的 `anthropicFamilyTier`），桌面选择器里的 `opus`／`sonnet`／`haiku` 因此能落到真实模型上。
   - ⚠️ **桌面应用只接受「读起来像 Anthropic 模型」的模型名**（含 `claude`/`opus`/`sonnet`/`haiku` 等），这是应用自身的限制：条目里只要有一个不合规的名字，整条配置都会被判为无效。因此 `deepseek-*`、`gpt-*`、`qwen-*` 这类**原名**无法直接写进桌面配置。
-  - **模型别名（让 DeepSeek 等接入桌面应用）**：这些服务商的 Anthropic 兼容端点自己就会把 Claude 模型名映射到它们的模型上，所以只要**发送 Claude 名**即可。切换时若发现没有可用模型名，会提供「使用标准 Claude 模型名」一键写入 `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`，也可手动填写；随时可用 **AI Provider Switcher: Configure Claude Desktop Models** 或 Claude 管理菜单修改，或恢复自动发现。别名会带上档位并标注来源网关（如 `Opus · deepseek`），避免误以为在用真 Claude。
-    - 以 DeepSeek 实测为例：`claude-opus-*` → `deepseek-v4-pro`，其余 `claude-*` → `deepseek-v4-flash`；裸名 `sonnet` 会被 DeepSeek 拒绝，所以别名要用带 `claude-` 前缀的完整名称。
-    - 别名是原样发给网关的，**是否生效取决于网关是否认识 Claude 名**。若网关只认自己的模型名，则该网关无法用于桌面应用。
+  - **高级兼容别名（仅旧配置或服务商明确要求时使用）**：这不是正常配置入口。全模型目录启用时，兼容别名完全不参与 Desktop 路由；新用户应直接使用全模型目录。只有服务商文档明确要求你把某个名称原样发送给它时，才在高级区填写。例如 `opus` / `sonnet` / `haiku` / `fable` 是没有世代编号的 Desktop 档位标识，分别代表最高能力、通用、快速/低成本、增强推理；它们**不是**任何具体 Claude 官方版本，也不保证每个中转站支持。不要猜测 `claude-*-数字` 名称；若不确定，留空即可。
+    - 旧用户保存的别名不会被自动修改，防止升级破坏已经可用的中转站；需要迁移时清空别名、改用全模型目录即可。
+  - **本地模型名改写代理（让 gpt-* 等非 Anthropic 模型也能上桌面应用）**：若中转站只认自己的字面模型名（如 `gpt-5.6`）而不认识 Claude 名，扩展会在本机 `127.0.0.1:<端口>` 起一个轻量转发器，把桌面应用发来的安全别名改写回真实模型名再转发给中转站——中转站收到的始终是字面模型名，无需它自己做映射。桌面配置的网关地址指向这个本地转发器，密钥仍写真实中转站 key 并原样透传。端口默认 `4180`，可用 `aiProviderSwitcher.claudeProxyPort` 修改。该代理运行在 VS Code 扩展宿主内、只监听本机回环，因此要求 Claude Desktop 与 VS Code 在同一台机器（Remote-SSH/WSL 下不可达）；VS Code 重载会重启代理，固定端口使地址保持稳定。
+  - **全模型目录（本地代理）**：在 Provider 的「Claude Desktop（独立应用）→ 配置 Desktop 模型」中先获取模型列表，再在「Desktop 全模型目录」点**添加已缓存的全部模型**，或只勾选需要的模型。每个 GPT、Claude 或其他模型都得到自己的 Desktop 路由；选择器的显示名保留真实模型名（如 `gpt-5.6 · REAL-Hajimi-GPT`），但内部使用安全 route ID，因此不触发 Desktop 的非 Anthropic 名字校验。全模型目录优先于高级兼容别名；点“清空全模型目录”即可恢复兼容别名或原生直连模式。
   - 切换后必须**完全退出并重启桌面应用**（含托盘图标）才生效。
   - 删除某个 Claude 中转站时，它在桌面配置库中的条目会一并清除；如果它正是桌面应用当前使用的，会同时恢复官方订阅。
   - ⚠️ 网关密钥会以明文写入该配置文件（这是桌面应用要求的格式），文件权限即为当前用户的数据目录权限。
@@ -568,16 +580,28 @@ Open the manager by either:
 
 ## Claude guide
 
-### Use a custom Claude provider
+### Configure Claude Code (VS Code / terminal)
 
-1. Open the manager and select **Manage Providers** on the Claude card.
-2. Add a named provider and enter its service root URL. Usually omit a trailing `/v1`.
-3. Quick-switch to the new provider.
-4. Enter the token when prompted.
-5. Review any external configuration conflicts.
-6. Configure model mapping if the provider exposes non-Claude model IDs.
-7. Select a command strategy.
-8. Reload VS Code and start a new Claude conversation.
+This flow affects Claude Code inside VS Code and terminal `claude` only; it **does not change Claude Desktop**:
+
+1. Open the manager; from the overview choose **Claude Code (VS Code / terminal) → Switch Claude Code provider**.
+2. If there is no provider yet, add one with the **＋** in the Claude list; enter its name, service root URL, and token. Usually omit a trailing `/v1`.
+3. In that provider's **Claude Code (VS Code / terminal)** section, choose **Configure Claude Code models**.
+4. Use **Fetch models from service**. For non-Claude model IDs, use **Auto-assign roles** as a starting point, then adjust main, fast, and 1M choices as needed.
+5. Choose **Save Claude Code configuration**. When the provider is active, the extension writes VS Code and terminal CLI configuration and offers a VS Code reload; start a new Claude conversation afterward.
+6. Command strategy also belongs only to Claude Code / CLI and is configured from that provider's **Command strategy** action.
+
+### Configure Claude Desktop (independent app)
+
+This flow affects Claude Desktop only; it **does not change Claude Code in VS Code or terminal CLI**:
+
+1. From the overview choose **Claude Desktop (independent app) → Switch Claude Desktop service**, then select the relay.
+2. In that provider's **Claude Desktop (independent app)** section, choose **Configure Desktop models**.
+3. In the **Full model catalogue**, choose **Add all cached models** or tick only the real models you need. This is the recommended path for a mixed GPT / Claude relay.
+4. Choose **Save Claude Desktop models**. It immediately rewrites the Desktop config only when Desktop is currently using that provider; otherwise it is applied the next time you switch Desktop to it.
+5. Fully quit and restart Claude Desktop according to the platform-specific instruction — closing a window is usually not enough.
+
+> **Advanced: legacy compatibility aliases** is only for an existing old configuration or a name the relay explicitly documents. New users do not need to configure it.
 
 ### Return to the official Claude subscription
 
@@ -591,9 +615,10 @@ Run **AI Provider Switcher: Use Claude Official Subscription**, review external 
   - The manager chip and switch dialog read the desktop state back from disk, so changes made inside the app or by another tool show up truthfully.
   - Switching writes the gateway's cached models into the entry's `inferenceModels`, so the desktop app stops running its own model discovery — the request most relays answer with 404, which is what leaves the model picker empty and every message failing with `Your organization's model list hasn't loaded yet`. **Refresh the model list first**, then switch. A configured model mapping is carried across as each entry's `anthropicFamilyTier`, which is what makes the `opus` / `sonnet` / `haiku` names in the desktop picker resolve to real models.
   - ⚠️ **The desktop app only accepts model names that read like Anthropic models** (containing `claude` / `opus` / `sonnet` / `haiku`, etc.). This is the app's own restriction: one non-compliant name invalidates the whole entry, so `deepseek-*`, `gpt-*`, `qwen-*` **original names** cannot be written directly.
-  - **Model aliases (how DeepSeek and friends reach the desktop app)**: these providers' Anthropic-compatible endpoints map Claude names onto their own models server-side, so sending Claude names is all it takes. When a switch finds no usable model, a one-click **Use standard Claude model names** set writes `claude-sonnet-4-5` / `claude-opus-4-5` / `claude-haiku-4-5`; hand-written aliases are also accepted and **AI Provider Switcher: Configure Claude Desktop Models** (or the Claude management menu) edits them any time. Aliases carry their tier and are labelled with the gateway they resolve to (e.g. `Opus · deepseek`), so the picker never pretends to offer genuine Claude models.
-    - DeepSeek, measured: `claude-opus-*` → `deepseek-v4-pro`, every other `claude-*` → `deepseek-v4-flash`; the bare `sonnet` name is rejected, so aliases use full `claude-`-prefixed names.
-    - Aliases are sent verbatim to the gateway — **whether they work depends on the gateway recognising Claude names**. A gateway that only accepts its own model IDs cannot be used with the desktop app.
+  - **Advanced compatibility aliases (only for old configuration or an explicit provider requirement)**: this is not the normal setup path. Once a full model catalogue is active, compatibility aliases do not participate in Desktop routing at all; new users should use the catalogue. Enter an alias only when the provider's documentation explicitly tells you to send that name verbatim. `opus` / `sonnet` / `haiku` / `fable` are generation-neutral Desktop tier labels — strongest, general-purpose, fast/low-cost, and enhanced reasoning — **not** specific official Claude versions, and no gateway is guaranteed to support them. Do not guess a `claude-*-number` model name; leave this empty when unsure.
+    - Existing saved aliases are never automatically changed, so an upgrade cannot break a working relay. To migrate, clear the aliases and use the full model catalogue.
+  - **Local model-name rewriting proxy (how gpt-* and other non-Anthropic models reach the desktop app)**: when the gateway only accepts its own literal model IDs (e.g. `gpt-5.6`) and does not recognise Claude names, the extension starts a lightweight forwarder on `127.0.0.1:<port>` that rewrites the desktop app's safe alias back to the real model before forwarding — so the gateway always receives its literal name and never has to map anything itself. The desktop config's gateway URL points at this local forwarder, while the key is still the real gateway key, forwarded untouched. The port defaults to `4180` (change it with `aiProviderSwitcher.claudeProxyPort`). The proxy lives inside the VS Code extension host and binds to loopback only, so Claude Desktop must be on the same machine (unreachable under Remote-SSH/WSL); a VS Code reload restarts the proxy, and the fixed port keeps the address stable.
+  - **Full model catalogue (local proxy)**: in a provider's **Claude Desktop (independent app) → Configure Desktop models** area, fetch the model list, then use **Add all cached models** in **Desktop full model catalogue** — or tick just the models you need. Each GPT, Claude, or other model gets a distinct Desktop route. The picker label retains the real model name (for example `gpt-5.6 · REAL-Hajimi-GPT`), while its internal ID is a safe opaque route so Desktop's non-Anthropic-name validation does not reject it. The full catalogue takes precedence over advanced compatibility aliases; **Clear full model catalogue** returns to aliases or native direct routing.
   - Fully quit and restart the desktop app (including the tray icon) after switching.
   - Deleting a Claude gateway also unlinks its desktop config entry and, when it was the live one, restores the official subscription.
   - ⚠️ The gateway key is written in plain text into that configuration file (the format the desktop app requires); file protection is whatever the user data directory provides.

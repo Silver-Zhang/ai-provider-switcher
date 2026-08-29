@@ -14,6 +14,7 @@ const {
   isDeepSeekAnthropicApi,
   mergeClaudeJsonEnv,
   mergeDeepSeekClaudeEnvironment,
+  mapClaudeDesktopModelName,
   normalizeClaudeModelMapping,
   normalizeClaudePermissionStrategy,
   normalizeClaudeProviderBaseUrl,
@@ -209,6 +210,40 @@ test("role suggestion reads `chat` as the ordinary model, not the strong one", (
   const reversed = suggestClaudeModelRoles(["deepseek-reasoner", "deepseek-chat"]);
   assert.equal(roleOf(reversed, "deepseek-reasoner"), "main");
   assert.equal(roleOf(reversed, "deepseek-chat"), "haiku");
+});
+
+test("desktop alias maps back to the real model by tier", () => {
+  const mapping = {
+    mainModel: "gpt-5.6",
+    opusModel: "gpt-5.6-opus",
+    sonnetModel: "gpt-5.6-sonnet",
+    haikuModel: "gpt-5.6-mini",
+    fableModel: "gpt-5.6-fable",
+    subagentModel: "gpt-5.6-mini"
+  };
+  assert.equal(mapClaudeDesktopModelName("claude-opus-5", mapping), "gpt-5.6-opus");
+  assert.equal(mapClaudeDesktopModelName("claude-sonnet-5", mapping), "gpt-5.6-sonnet");
+  assert.equal(mapClaudeDesktopModelName("claude-haiku-5", mapping), "gpt-5.6-mini");
+  assert.equal(mapClaudeDesktopModelName("claude-fable-5", mapping), "gpt-5.6-fable");
+  // Bare tier names and the desktop app's `anthropic/` prefix both resolve.
+  assert.equal(mapClaudeDesktopModelName("opus", mapping), "gpt-5.6-opus");
+  assert.equal(mapClaudeDesktopModelName("anthropic/claude-opus-5", mapping), "gpt-5.6-opus");
+  // The `[1m]` capability marker is shed before forwarding, case-insensitively.
+  assert.equal(mapClaudeDesktopModelName("claude-opus-5[1m]", mapping), "gpt-5.6-opus");
+  assert.equal(mapClaudeDesktopModelName("claude-opus-5[1M]", mapping), "gpt-5.6-opus");
+  // `mythos` and unknown names have no mapping role, so they fall to the main model.
+  assert.equal(mapClaudeDesktopModelName("claude-mythos-5", mapping), "gpt-5.6");
+  assert.equal(mapClaudeDesktopModelName("some-unknown", mapping), "gpt-5.6");
+  // No mapping means nothing to rewrite.
+  assert.equal(mapClaudeDesktopModelName("claude-opus-5", undefined), "claude-opus-5");
+});
+
+test("desktop alias falls back to the main model when a tier is unset", () => {
+  // fableModel omitted: normalization backfills it from mainModel, but the rewrite
+  // must not return undefined for the fable route.
+  const mapping = { mainModel: "gpt-5.6", opusModel: "gpt-5.6-opus" };
+  assert.equal(mapClaudeDesktopModelName("claude-fable-5", mapping), "gpt-5.6");
+  assert.equal(mapClaudeDesktopModelName("claude-sonnet-5", mapping), "gpt-5.6");
 });
 
 test("role suggestion still names a main model when nothing looks fast or strong", () => {

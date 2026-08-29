@@ -4,10 +4,13 @@ const {
   CLAUDE_DESKTOP_1P_MODE,
   CLAUDE_DESKTOP_3P_MODE,
   CLAUDE_DESKTOP_ALIAS_MODELS,
+  CLAUDE_DESKTOP_GENERIC_TIER_ALIASES,
   applyClaudeDesktopEntry,
   buildClaudeDesktopAliasEntries,
   buildClaudeDesktopGatewayConfig,
   buildClaudeDesktopModelEntries,
+  buildClaudeDesktopRouteEntries,
+  buildClaudeDesktopRoutes,
   resolveDesktopAlias1m,
   inferClaudeDesktopTier,
   isClaudeDesktopCompatibleModel,
@@ -21,7 +24,9 @@ const {
   resolveClaudeDesktopLayout,
   serializeClaudeDesktopMeta,
   setClaudeDesktopDeploymentMode,
-  toClaudeDesktopEntryId
+  stripClaudeDesktopRouteSuffix,
+  toClaudeDesktopEntryId,
+  toClaudeDesktopRouteId
 } = require("../out/claudeDesktop.js");
 
 test("Windows probes Local before Roaming", () => {
@@ -355,15 +360,44 @@ test("a BOM-prefixed desktop config still parses", () => {
   assert.equal(meta.appliedId, "x");
 });
 
-test("the standard alias set is one entry per tier and all names pass the app's check", () => {
-  assert.deepEqual([...CLAUDE_DESKTOP_ALIAS_MODELS], [
-    "claude-sonnet-5",
-    "claude-opus-5",
-    "claude-haiku-5"
+test("opaque catalogue routes keep real model IDs out of Claude Desktop", () => {
+  const gptRoute = toClaudeDesktopRouteId("hajimi-account-a", "gpt-5.6");
+  assert.equal(gptRoute, toClaudeDesktopRouteId("hajimi-account-a", "gpt-5.6"));
+  assert.notEqual(gptRoute, toClaudeDesktopRouteId("hajimi-account-b", "gpt-5.6"));
+  assert.notEqual(gptRoute, toClaudeDesktopRouteId("hajimi-account-a", "claude-opus-5"));
+  assert.match(gptRoute, /^claude-route-[a-f0-9]{16}$/);
+  assert.equal(isClaudeDesktopCompatibleModel(gptRoute), true);
+  assert.equal(gptRoute.includes("gpt"), false);
+
+  const routes = buildClaudeDesktopRoutes("hajimi-account-a", [
+    { name: "gpt-5.6", supports1m: true },
+    { name: "claude-opus-5" },
+    { name: "gpt-5.6", supports1m: false },
+    { name: "" }
   ]);
-  for (const name of CLAUDE_DESKTOP_ALIAS_MODELS) {
+  assert.equal(routes.length, 2);
+  const entries = buildClaudeDesktopRouteEntries(routes, "REAL-Hajimi-GPT");
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].name, gptRoute);
+  assert.equal(entries[0].labelOverride, "gpt-5.6 · REAL-Hajimi-GPT");
+  assert.equal(entries[0].supports1m, true);
+  // One default per inferred family: GPT falls back to Sonnet while Opus keeps
+  // its own family, and neither route is lost from the picker.
+  assert.equal(entries.filter((entry) => entry.isFamilyDefault).length, 2);
+  assert.equal(stripClaudeDesktopRouteSuffix(`${gptRoute}[1M]`), gptRoute);
+  assert.equal(stripClaudeDesktopRouteSuffix(`anthropic/${gptRoute}[1m]`), gptRoute);
+});
+
+test("generic tier aliases are generation-neutral and desktop-compatible", () => {
+  assert.deepEqual([...CLAUDE_DESKTOP_GENERIC_TIER_ALIASES], ["sonnet", "opus", "haiku", "fable"]);
+  for (const name of CLAUDE_DESKTOP_GENERIC_TIER_ALIASES) {
     assert.equal(isClaudeDesktopCompatibleModel(name), true, name);
   }
+  // Kept only so existing saved configurations keep working. New UI must never
+  // present these version-specific names as a standard or a future-proof choice.
+  assert.deepEqual([...CLAUDE_DESKTOP_ALIAS_MODELS], [
+    "claude-sonnet-5", "claude-opus-5", "claude-haiku-5"
+  ]);
 });
 
 test("a tier is read out of an Anthropic-style model ID", () => {

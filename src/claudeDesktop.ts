@@ -74,6 +74,15 @@ export type ClaudeDesktopModelEntry = {
   labelOverride?: string;
 };
 
+export type ClaudeDesktopRoute = {
+  /** Desktop-safe, stable identifier sent to the local rewriting proxy. */
+  routeId: string;
+  /** Exact model ID that the proxy forwards to the upstream relay. */
+  model: string;
+  /** Whether this exact model exposes the 1M context variant. */
+  supports1m?: boolean;
+};
+
 export type ClaudeDesktopGatewaySettings = {
   baseUrl: string;
   apiKey: string;
@@ -174,11 +183,25 @@ export function buildClaudeDesktopModelEntries(
  * the names track the current Claude generations so the picker does not look
  * dated.
  */
+/**
+ * @deprecated Kept only so an older saved configuration can keep working. New
+ * UI must not present these generation-specific IDs as "standard": service
+ * providers decide what aliases they accept, and a future Claude generation
+ * would otherwise make the default stale or misleading.
+ */
 export const CLAUDE_DESKTOP_ALIAS_MODELS = [
   "claude-sonnet-5",
   "claude-opus-5",
   "claude-haiku-5"
 ] as const;
+
+/**
+ * Generation-neutral Desktop tier identifiers. They pass Desktop's compatibility
+ * check without guessing an official model number. They only work when the
+ * gateway explicitly documents support for them, so the UI keeps them in the
+ * advanced compatibility section rather than treating them as a normal setup.
+ */
+export const CLAUDE_DESKTOP_GENERIC_TIER_ALIASES = ["sonnet", "opus", "haiku", "fable"] as const;
 
 /**
  * Decides which desktop aliases advertise 1M. An alias resolves to whatever the
@@ -205,6 +228,69 @@ export function resolveDesktopAlias1m(
 export function inferClaudeDesktopTier(name: string): ClaudeDesktopTier | undefined {
   const model = name.trim().toLowerCase();
   return CLAUDE_DESKTOP_TIERS.find((tier) => new RegExp(`(^|[^a-z])${tier}([^a-z]|$)`).test(model));
+}
+
+/**
+ * Stable and opaque per-model route ID for the Desktop model catalogue.
+ *
+ * It deliberately does not incorporate the model text itself: Claude Desktop
+ * rejects any route ID that says `gpt`, `qwen`, etc., so even
+ * `claude-route-gpt-5-6` is not valid. A short SHA-256 suffix keeps the ID safe,
+ * repeatable across restarts, and distinct for the same model at two accounts.
+ */
+export function toClaudeDesktopRouteId(providerId: string, model: string): string {
+  const digest = createHash("sha256")
+    .update(`ai-provider-switcher:desktop-route:${providerId} ${model.trim()}`)
+    .digest("hex")
+    .slice(0, 16);
+  return `claude-route-${digest}`;
+}
+
+/** Turns selected real models into Desktop-safe proxy routes. */
+export function buildClaudeDesktopRoutes(
+  providerId: string,
+  models: Array<{ name: string; supports1m?: boolean }>
+): ClaudeDesktopRoute[] {
+  const seen = new Set<string>();
+  return models.flatMap((row) => {
+    const model = row.name.trim();
+    if (!model || seen.has(model)) return [];
+    seen.add(model);
+    return [{ routeId: toClaudeDesktopRouteId(providerId, model), model, supports1m: row.supports1m === true }];
+  });
+}
+
+/**
+ * Builds explicitly selected catalogue routes. Labels retain the real model for
+ * the picker, while names remain opaque Claude-safe IDs. Unknown families take
+ * Sonnet as their picker family; only the first entry in a family becomes its
+ * default, so multiple GPT models remain individually selectable.
+ */
+export function buildClaudeDesktopRouteEntries(
+  routes: ClaudeDesktopRoute[],
+  source: string
+): ClaudeDesktopModelEntry[] {
+  const claimed = new Set<ClaudeDesktopTier>();
+  const gateway = source.trim();
+  return routes.map((route) => {
+    const tier = inferClaudeDesktopTier(route.model) ?? "sonnet";
+    const entry: ClaudeDesktopModelEntry = {
+      name: route.routeId,
+      anthropicFamilyTier: tier,
+      labelOverride: gateway ? `${route.model} · ${gateway}` : route.model
+    };
+    if (!claimed.has(tier)) {
+      entry.isFamilyDefault = true;
+      claimed.add(tier);
+    }
+    if (route.supports1m) entry.supports1m = true;
+    return entry;
+  });
+}
+
+/** Removes the local capability suffix before matching an incoming proxy route. */
+export function stripClaudeDesktopRouteSuffix(model: string): string {
+  return model.trim().replace(/^anthropic\//i, "").replace(/\[1m\]$/i, "").trim();
 }
 
 /** `Opus · deepseek`, so the picker shows which gateway is really answering. */
