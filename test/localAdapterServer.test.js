@@ -131,3 +131,32 @@ test("maps a Responses text SSE lifecycle into Anthropic events", async () => {
     assert.match(response.body, /"stop_reason":"end_turn"/);
   } finally { adapter.stop(); target.stop(); }
 });
+
+test("adapter never reports completion after an upstream tool-use stream", async () => {
+  const target = await streamingUpstream([
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","model":"claude-test"}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","id":"tool_1","name":"bash","input":{}}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+  ]);
+  const adapter = await startLocalAdapterServer({ port: 0, resolve: () => ({ direction: "responsesToAnthropic", upstreamBaseUrl: `http://127.0.0.1:${target.port}`, upstreamToken: "upstream", localToken: "local", models: [] }) });
+  try {
+    const response = await request(adapter.port, "/codex/binding/v1/responses", { model: "claude-test", max_output_tokens: 10, stream: true, input: "Hi" });
+    assert.equal(response.status, 200);
+    assert.match(response.body, /event: response\.failed/);
+    assert.doesNotMatch(response.body, /event: response\.completed/);
+  } finally { adapter.stop(); target.stop(); }
+});
+
+test("adapter emits an Anthropic error instead of message_stop after Responses failure", async () => {
+  const target = await streamingUpstream([
+    'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1"}}\n\n',
+    'event: response.failed\ndata: {"type":"response.failed"}\n\n'
+  ]);
+  const adapter = await startLocalAdapterServer({ port: 0, resolve: () => ({ direction: "anthropicToResponses", upstreamBaseUrl: `http://127.0.0.1:${target.port}`, upstreamToken: "upstream", localToken: "local", models: [] }) });
+  try {
+    const response = await request(adapter.port, "/claude/binding/v1/messages", { model: "gpt-test", max_tokens: 10, stream: true, messages: [{ role: "user", content: "Hi" }] });
+    assert.equal(response.status, 200);
+    assert.match(response.body, /event: error/);
+    assert.doesNotMatch(response.body, /event: message_stop/);
+  } finally { adapter.stop(); target.stop(); }
+});
