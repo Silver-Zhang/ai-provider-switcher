@@ -1112,7 +1112,10 @@ async function saveClaudeProviderEdit(
 
   const updated: GatewayProfile = { ...gateway, name: plan.name, baseUrl: plan.baseUrl };
   await updateGatewayProfile(updated);
-  if (plan.secret) await context.secrets.store(`${SECRET_KEY_PREFIX}${gateway.id}`, plan.secret);
+  if (plan.secret) {
+    await context.secrets.store(`${SECRET_KEY_PREFIX}${gateway.id}`, plan.secret);
+    await refreshProtocolAdapterSecrets(context);
+  }
   if (plan.effects.clearModelCache) await clearGatewayModels(gateway.id);
 
   if (plan.effects.rewriteLiveConfig) {
@@ -1185,6 +1188,7 @@ async function saveCodexProviderEdit(
   if (plan.secret) {
     // The key file path is derived from the unchanged provider ID, so the helper keeps working.
     await context.secrets.store(`${CODEX_SECRET_KEY_PREFIX}${provider.id}`, plan.secret);
+    await refreshProtocolAdapterSecrets(context);
     await writeCodexApiKeyFile(updated, plan.secret);
   }
   if (plan.effects.clearModelCache) await clearCodexModels(provider.id);
@@ -1907,6 +1911,11 @@ async function preloadProtocolAdapterSecrets(context: vscode.ExtensionContext): 
   }
 }
 
+async function refreshProtocolAdapterSecrets(context: vscode.ExtensionContext): Promise<void> {
+  if (!protocolAdapterServer) return;
+  await preloadProtocolAdapterSecrets(context);
+}
+
 /**
  * How to actually quit Claude Desktop, in the terms of the platform the user is
  * on. "Fully quit" is not the same gesture everywhere — closing the window keeps
@@ -2528,6 +2537,7 @@ async function getOrRequestGatewayToken(
 
   const token = entered.trim();
   await context.secrets.store(secretKey, token);
+  await refreshProtocolAdapterSecrets(context);
   return token;
 }
 
@@ -4056,6 +4066,7 @@ async function getOrRequestCodexApiKey(
 
   const apiKey = entered.trim();
   await context.secrets.store(secretKey, apiKey);
+  await refreshProtocolAdapterSecrets(context);
   await writeCodexApiKeyFile(provider, apiKey);
   return apiKey;
 }
