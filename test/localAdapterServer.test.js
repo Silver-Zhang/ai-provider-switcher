@@ -160,3 +160,16 @@ test("adapter emits an Anthropic error instead of message_stop after Responses f
     assert.doesNotMatch(response.body, /event: message_stop/);
   } finally { adapter.stop(); target.stop(); }
 });
+
+test("direct adapter paths are isolated by binding id and client target", async () => {
+  const target = await upstream((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "msg", model: "x", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })); });
+  const adapter = await startLocalAdapterServer({ port: 0, resolve: (id, client) => id === "good" && client === "codex" ? { direction: "responsesToAnthropic", upstreamBaseUrl: `http://127.0.0.1:${target.port}`, upstreamToken: "upstream", localToken: "local", models: [] } : undefined });
+  try {
+    const wrongBinding = await request(adapter.port, "/codex/missing/v1/responses", { model: "x", input: "hi" });
+    assert.equal(wrongBinding.status, 503);
+    const wrongTarget = await request(adapter.port, "/claude/good/v1/messages", { model: "x", max_tokens: 1, messages: [{ role: "user", content: "hi" }] });
+    assert.equal(wrongTarget.status, 503);
+    const invalidPath = await request(adapter.port, "/codex/good/v1/chat/completions", { model: "x" });
+    assert.equal(invalidPath.status, 404);
+  } finally { adapter.stop(); target.stop(); }
+});
