@@ -112,6 +112,22 @@ AI Provider Switcher 将这些工作集中到一个可视化入口：
 >
 > ⚠️ Codex 代理的**自动探测**在 Linux 上支持 GNOME（`gsettings org.gnome.system.proxy`）与 KDE（`~/.config/kioslaverc`）；Xfce 或无桌面环境下探测返回空，不会报错。macOS 上如果系统代理是 PAC/WPAD 自动配置脚本，探测会明确告诉你脚本地址——Codex 无法执行 PAC，需要你从代理软件里读出实际端口再手动填写。任何平台下都可以先导出 `HTTPS_PROXY` 环境变量，或直接手动填写代理地址——手动填写在所有平台上效果完全相同。
 
+### 多用户 Linux 服务器的本地端口
+
+Claude Desktop 模型路由和实验性协议转换都只监听 `127.0.0.1`，但在普通的多人 Linux 服务器上，回环端口由整个网络命名空间共享，**不会按 Unix 用户自动隔离**。插件在 Linux 上未检测到明确端口设置时，会从当前用户 UID 稳定推导一对用户专属端口（模型路由为偶数、协议转换为相邻奇数，范围 `24000–32000`）；同一用户重启后端口不变，不同普通用户通常不同。
+
+Windows 和 macOS 保持默认 `4180`（Desktop 模型路由）与 `4181`（实验性协议转换）。管理员或用户可以显式覆盖：
+
+```jsonc
+{
+  // 给团队分配连续端口对：偶数给 Desktop 模型路由，奇数给协议转换
+  "aiProviderSwitcher.claudeProxyPort": 26000,
+  "aiProviderSwitcher.protocolAdapterPort": 26001
+}
+```
+
+若端口已被占用，插件会明确提示并拒绝启动该本地路由，**不会随机换端口**，因为 Claude Desktop / Codex 已保存旧 URL，静默换端口只会造成“配置成功但无法连接”。修改端口后重新加载 VS Code，再重新应用 Desktop 服务或实验性绑定即可。其他直连服务不受端口冲突影响。
+
 ### 远程开发（Remote-SSH / WSL / 容器）
 
 扩展声明为 `"extensionKind": ["workspace", "ui"]`，即在远程窗口中**默认运行在远程侧**。这是终端 CLI 场景下正确的选择：Claude Code 与 Codex 跑在远程主机上，`~/.claude`、`~/.codex` 也在远程主机上，配置必须写到那里。
@@ -549,6 +565,22 @@ Requirements:
 - Install and enable the official OpenAI Codex IDE extension to use Codex features.
 - A custom Claude provider must expose a compatible Anthropic API.
 - A custom Codex provider must implement the OpenAI Responses API. Chat Completions-only gateways are not supported.
+
+### Local ports on multi-user Linux servers
+
+Claude Desktop model routing and experimental protocol conversion listen only on `127.0.0.1`, but a normal multi-user Linux server shares loopback ports within its network namespace — they are **not automatically isolated per Unix user**. When no explicit port is configured on Linux, the extension derives a stable user-specific pair from the current UID (an even port for Desktop model routing and the adjacent odd port for protocol conversion, in `24000–32000`). The same user keeps the same ports after restart; ordinary different users normally receive different pairs.
+
+Windows and macOS retain `4180` for Desktop model routing and `4181` for experimental protocol conversion. An administrator or user can explicitly assign a pair:
+
+```jsonc
+{
+  // Allocate consecutive pairs: even for Desktop model routing, odd for conversion.
+  "aiProviderSwitcher.claudeProxyPort": 26000,
+  "aiProviderSwitcher.protocolAdapterPort": 26001
+}
+```
+
+If a port is occupied, the extension reports it and refuses to start that local route; it **never silently picks a random port**, because Claude Desktop / Codex persist the old URL and a silent replacement would look configured but fail to connect. After changing a port, reload VS Code and reapply the Desktop service or experimental binding. Direct services are unaffected by a local-port conflict.
 
 ### Remote development (Remote-SSH / WSL / containers)
 

@@ -106,6 +106,7 @@ import {
 } from "./claudeConfig";
 import { startClaudeProxy, type ClaudeProxy } from "./claudeProxy";
 import { startLocalAdapterServer, type LocalAdapterServer, type AdapterBindingTarget } from "./localAdapterServer";
+import { resolveLocalPort, type LocalPortChoice } from "./localPort";
 import {
   applyClaudeDesktopEntry,
   buildClaudeDesktopGatewayConfig,
@@ -201,23 +202,31 @@ const GATEWAY_MODELS_KEY = "gatewayModels";
 const CLAUDE_ACTIVE_PROVIDER_KEY = "claudeActiveProviderId";
 const CLAUDE_DESKTOP_ROOT_KEY = "claudeDesktopConfigRoot";
 const CLAUDE_PROXY_PORT_KEY = "claudeProxyPort";
-const CLAUDE_PROXY_DEFAULT_PORT = 4180;
 const PROTOCOL_ADAPTER_PORT_KEY = "protocolAdapterPort";
-const PROTOCOL_ADAPTER_DEFAULT_PORT = 4181;
 const PROTOCOL_ADAPTER_SECRET_KEY_PREFIX = "aiProviderSwitcher.protocolAdapter.localToken.";
 
-/**
- * Both local servers bind a fixed, user-configurable port. A stable address is
- * essential: Desktop/Codex persist the loopback URL and cannot discover an
- * ephemeral replacement after VS Code reloads. If the chosen port is occupied
- * we fail the experimental binding explicitly rather than silently moving it.
- */
+function configuredLocalPort(kind: "claudeProxy" | "protocolAdapter"): LocalPortChoice {
+  const key = kind === "claudeProxy" ? CLAUDE_PROXY_PORT_KEY : PROTOCOL_ADAPTER_PORT_KEY;
+  const config = vscode.workspace.getConfiguration("aiProviderSwitcher");
+  const inspected = config.inspect<number>(key);
+  const explicitlySet = inspected?.globalValue !== undefined || inspected?.workspaceValue !== undefined || inspected?.workspaceFolderValue !== undefined;
+  return resolveLocalPort({
+    kind,
+    configured: config.get<number>(key),
+    configuredExplicitly: explicitlySet,
+    platform: process.platform,
+    uid: process.getuid?.()
+  });
+}
+
+function portDescription(choice: LocalPortChoice, key: string): string {
+  if (choice.source === "linux-user") return `Linux 多用户自动端口 ${choice.port}（按当前 UID 稳定生成）。`;
+  if (choice.source === "manual") return `使用手动设置的端口 ${choice.port}（${key}）。`;
+  return `使用默认端口 ${choice.port}。`;
+}
+
 function protocolAdapterPort(): number {
-  const configured = vscode.workspace.getConfiguration("aiProviderSwitcher")
-    .get<number>(PROTOCOL_ADAPTER_PORT_KEY, PROTOCOL_ADAPTER_DEFAULT_PORT);
-  return typeof configured === "number" && configured >= 1024 && configured <= 65535
-    ? configured
-    : PROTOCOL_ADAPTER_DEFAULT_PORT;
+  return configuredLocalPort("protocolAdapter").port;
 }
 
 function protocolAdapterBaseUrl(binding: ProtocolAdapterBinding): string {
@@ -1786,12 +1795,8 @@ function resolveClaudeDesktopProxyTarget(model: string): { baseUrl: string; mode
  */
 async function startClaudeProxyForExtension(context: vscode.ExtensionContext): Promise<void> {
   try {
-    const configured = vscode.workspace
-      .getConfiguration("aiProviderSwitcher")
-      .get<number>(CLAUDE_PROXY_PORT_KEY, CLAUDE_PROXY_DEFAULT_PORT);
-    const port = typeof configured === "number" && configured >= 1024 && configured <= 65535
-      ? configured
-      : CLAUDE_PROXY_DEFAULT_PORT;
+    const choice = configuredLocalPort("claudeProxy");
+    const port = choice.port;
     const proxy = await startClaudeProxy({ port, resolve: resolveClaudeDesktopProxyTarget });
     claudeProxy = proxy;
     if (proxy.bindWarning) {
@@ -1808,7 +1813,7 @@ async function startClaudeProxyForExtension(context: vscode.ExtensionContext): P
   } catch (error) {
     claudeProxy = undefined;
     vscode.window.showWarningMessage(
-      `Claude Desktop 本地改写代理启动失败：${error instanceof Error ? error.message : "未知错误"}`
+      `Claude Desktop 本地改写代理无法监听 127.0.0.1:${configuredLocalPort("claudeProxy").port}：${errorText(error)}。${portDescription(configuredLocalPort("claudeProxy"), `aiProviderSwitcher.${CLAUDE_PROXY_PORT_KEY}`)} 请修改该设置、重新加载 VS Code，并重新切换 Claude Desktop 服务。直接服务不受影响。`
     );
   }
 }
@@ -1819,7 +1824,8 @@ async function startProtocolAdapterForExtension(context: vscode.ExtensionContext
   if (!hasBindings) return;
   try {
     await preloadProtocolAdapterSecrets(context);
-    const port = protocolAdapterPort();
+    const choice = configuredLocalPort("protocolAdapter");
+    const port = choice.port;
     const server = await startLocalAdapterServer({
       port,
       resolve: (bindingId, target) => resolveProtocolAdapterTarget(context, bindingId, target)
@@ -1836,7 +1842,8 @@ async function startProtocolAdapterForExtension(context: vscode.ExtensionContext
     });
   } catch (error) {
     protocolAdapterServer = undefined;
-    vscode.window.showWarningMessage(`实验性协议转换器启动失败：${errorText(error)}。直接服务不受影响。`);
+    const choice = configuredLocalPort("protocolAdapter");
+    vscode.window.showWarningMessage(`实验性协议转换器无法监听 127.0.0.1:${choice.port}：${errorText(error)}。${portDescription(choice, `aiProviderSwitcher.${PROTOCOL_ADAPTER_PORT_KEY}`)} 请修改该设置、重新加载 VS Code，并重新创建或重新应用实验性绑定。直接服务不受影响。`);
   }
 }
 

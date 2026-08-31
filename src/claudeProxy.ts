@@ -167,21 +167,12 @@ export function startClaudeProxy(options: {
   };
 
   return new Promise((resolveStart, rejectStart) => {
-    let fellBack = false;
-    server.on("error", (error) => {
-      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE" && !fellBack) {
-        fellBack = true;
-        server.listen(0, "127.0.0.1");
-        return;
-      }
-      rejectStart(error);
-    });
+    server.on("error", (error) => rejectStart(error));
     server.listen(options.port, "127.0.0.1", () => {
       const address = server.address();
       const port = typeof address === "object" && address ? address.port : options.port;
       resolveStart({
         port,
-        bindWarning: port !== options.port ? `端口 ${options.port} 已被占用，改用 ${port}。` : undefined,
         stop() {
           server.close();
         }

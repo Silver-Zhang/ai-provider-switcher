@@ -376,14 +376,14 @@
           "default": 4180,
           "minimum": 1024,
           "maximum": 65535,
-          "description": "Local port for the Claude Desktop model-name rewriting proxy. Non-Anthropic relays (e.g. gpt-*) reach Claude Desktop through Claude aliases, and this proxy rewrites those aliases back to the real model before forwarding. Leave at the default unless 4180 is in use."
+          "description": "Local port for the Claude Desktop model-name rewriting proxy. On Windows/macOS the default is 4180; on Linux, when this setting has not been explicitly set, a stable port derived from the current Unix UID is used to avoid multi-user server conflicts. Set an explicit port to override either policy."
         },
         "aiProviderSwitcher.protocolAdapterPort": {
           "type": "number",
           "default": 4181,
           "minimum": 1024,
           "maximum": 65535,
-          "description": "Loopback port for explicit experimental protocol-conversion bindings. It is separate from Claude Desktop model routing and only starts when a binding exists. Text and streaming only: tools, images, files, reasoning, and Agent workflows are unsupported."
+          "description": "Loopback port for explicit experimental protocol-conversion bindings. On Windows/macOS the default is 4181; on Linux, when this setting has not been explicitly set, a stable port derived from the current Unix UID is used to avoid multi-user server conflicts. It is separate from Claude Desktop model routing and only starts when a binding exists. Text and streaming only: tools, images, files, reasoning, and Agent workflows are unsupported."
         },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",
