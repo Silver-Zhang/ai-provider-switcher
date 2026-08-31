@@ -177,6 +177,16 @@ test("creates a Codex-native model catalog for the picker", () => {
   assert.equal(catalog.models[0].supported_in_api, true);
 });
 
+test("marks a text-only adapter catalog honestly", () => {
+  const catalog = createCodexModelCatalog(["claude-opus-5"], true);
+  const model = catalog.models[0];
+  assert.equal(model.supports_parallel_tool_calls, false);
+  assert.equal(model.supports_reasoning_summary_parameter, false);
+  assert.deepEqual(model.input_modalities, ["text"]);
+  assert.equal(model.shell_type, null);
+  assert.match(model.description, /text and streaming only/);
+});
+
 test("documents trimming encrypted key files before DPAPI decryption", () => {
   const extensionSource = require("node:fs").readFileSync(
     require("node:path").join(__dirname, "..", "src", "extension.ts"),

@@ -208,6 +208,18 @@
               "baseUrl": {
                 "type": "string"
               },
+              "adapter": {
+                "type": "object",
+                "description": "Explicit experimental local protocol-conversion binding. Direct providers omit this field and keep their existing routing unchanged.",
+                "required": ["id", "direction", "upstreamKind", "upstreamId", "textOnly"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "direction": { "type": "string", "enum": ["anthropicToResponses", "responsesToAnthropic"] },
+                  "upstreamKind": { "type": "string", "enum": ["claudeGateway", "codexProvider"] },
+                  "upstreamId": { "type": "string" },
+                  "textOnly": { "type": "boolean", "const": true }
+                }
+              },
               "desktopModels": {
                 "type": "array",
                 "description": "Optional Anthropic-style model IDs to offer Claude Desktop for this gateway, used instead of its discovered model names. Claude Desktop refuses IDs that do not read as Anthropic routes (deepseek-*, gpt-*, qwen-*), so a gateway serving its own names can only be reached by sending Claude names it maps itself. The IDs are sent upstream verbatim.",
@@ -366,6 +378,13 @@
           "maximum": 65535,
           "description": "Local port for the Claude Desktop model-name rewriting proxy. Non-Anthropic relays (e.g. gpt-*) reach Claude Desktop through Claude aliases, and this proxy rewrites those aliases back to the real model before forwarding. Leave at the default unless 4180 is in use."
         },
+        "aiProviderSwitcher.protocolAdapterPort": {
+          "type": "number",
+          "default": 4181,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Loopback port for explicit experimental protocol-conversion bindings. It is separate from Claude Desktop model routing and only starts when a binding exists. Text and streaming only: tools, images, files, reasoning, and Agent workflows are unsupported."
+        },
         "aiProviderSwitcher.codexProviders": {
           "type": "array",
           "description": "Named OpenAI Responses API-compatible Codex providers. Enter only the provider root URL; /v1 is added automatically. API keys are stored separately in VS Code Secret Storage and an encrypted local helper file.",
@@ -385,6 +404,18 @@
               },
               "baseUrl": {
                 "type": "string"
+              },
+              "adapter": {
+                "type": "object",
+                "description": "Explicit experimental local protocol-conversion binding. Direct providers omit this field and keep their existing routing unchanged.",
+                "required": ["id", "direction", "upstreamKind", "upstreamId", "textOnly"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "direction": { "type": "string", "enum": ["anthropicToResponses", "responsesToAnthropic"] },
+                  "upstreamKind": { "type": "string", "enum": ["claudeGateway", "codexProvider"] },
+                  "upstreamId": { "type": "string" },
+                  "textOnly": { "type": "boolean", "const": true }
+                }
               },
               "usage": {
                 "type": "object",

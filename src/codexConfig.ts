@@ -223,12 +223,14 @@ export function parseCodexModelIds(value: string): string[] {
 }
 
 /** Build a Codex model catalog so custom-provider models appear in Codex's own picker. */
-export function createCodexModelCatalog(modelIds: string[]): { models: Array<Record<string, unknown>> } {
+export function createCodexModelCatalog(modelIds: string[], textOnly = false): { models: Array<Record<string, unknown>> } {
   return {
     models: [...new Set(modelIds.map((model) => model.trim()).filter(Boolean))].map((model, index) => ({
       slug: model,
       display_name: model,
-      description: `Available from the active custom provider`,
+      description: textOnly
+        ? "Experimental local protocol conversion: text and streaming only; tools, images, files and reasoning are unsupported."
+        : "Available from the active custom provider",
       default_reasoning_level: "medium",
       supported_reasoning_levels: [
         { effort: "low", description: "Low" },
@@ -236,7 +238,7 @@ export function createCodexModelCatalog(modelIds: string[]): { models: Array<Rec
         { effort: "high", description: "High" },
         { effort: "xhigh", description: "Extra high" }
       ],
-      shell_type: "shell_command",
+      shell_type: textOnly ? null : "shell_command",
       visibility: "list",
       supported_in_api: true,
       priority: modelPriority(model, index),
@@ -248,14 +250,14 @@ export function createCodexModelCatalog(modelIds: string[]): { models: Array<Rec
       base_instructions: "You are Codex, a coding agent. Collaborate with the user in their workspace.",
       model_messages: null,
       include_skills_usage_instructions: false,
-      supports_reasoning_summary_parameter: true,
-      default_reasoning_summary: "auto",
+      supports_reasoning_summary_parameter: !textOnly,
+      default_reasoning_summary: textOnly ? null : "auto",
       support_verbosity: false,
       default_verbosity: null,
       apply_patch_tool_type: null,
       web_search_tool_type: "text",
       truncation_policy: { mode: "bytes", limit: 10000 },
-      supports_parallel_tool_calls: true,
+      supports_parallel_tool_calls: !textOnly,
       supports_image_detail_original: false,
       context_window: null,
       max_context_window: null,
@@ -263,7 +265,7 @@ export function createCodexModelCatalog(modelIds: string[]): { models: Array<Rec
       comp_hash: null,
       effective_context_window_percent: 95,
       experimental_supported_tools: [],
-      input_modalities: ["text", "image"],
+      input_modalities: textOnly ? ["text"] : ["text", "image"],
       supports_search_tool: false,
       use_responses_lite: false,
       auto_review_model_override: null,

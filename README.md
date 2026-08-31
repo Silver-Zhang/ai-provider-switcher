@@ -343,6 +343,23 @@ NO_PROXY="localhost,127.0.0.1,::1"
 - 写入前会检查非本扩展管理的重复代理变量。
 - “停用插件管理的代理”只删除标记块，保留其他 `.env` 内容。
 
+## 实验性协议转换（文本与流式基础版）
+
+默认情况下，服务直接连接到匹配的客户端协议：Anthropic Messages 服务用于 Claude Code / Claude Desktop，OpenAI Responses 服务用于 Codex。若上游只有另一种协议，可在管理器首页的 **实验性协议转换** 创建一个独立的本地绑定：
+
+```text
+Anthropic Messages 服务 → 本地转换 → Codex
+OpenAI Responses 服务 → 本地转换 → Claude Code / Claude Desktop
+```
+
+这会创建一个新的、明确标记为实验性的本地服务；**不会修改原有直连服务、模型目录、Token 或当前客户端配置**。本地服务只监听 `127.0.0.1`，VS Code 扩展宿主必须运行。它目前只支持：
+
+- 纯文本、多轮文本与普通流式输出；
+- 模型 ID、system/instructions 和基础 token usage；
+- 从已缓存上游模型列表产生模型目录。
+
+它目前明确不支持并会返回错误：工具调用、图片、文件、thinking/reasoning、structured output、缓存/压缩上下文以及完整 Claude Code / Codex Agent 编码工作流。因此请把它当作协议与模型连通性的验证功能，而不是完整 Agent 兼容层。删除被转换绑定引用的上游服务会被阻止，需先删除该绑定。
+
 ## 数据、安全和配置文件
 
 | 内容 | 保存位置与行为 |
@@ -702,6 +719,19 @@ If detection fails, enter a full HTTP(S) proxy URL such as `http://127.0.0.1:789
 ### Safe `.env` management
 
 The extension owns only a marked block in `~/.codex/.env`. It checks existing unmanaged `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` entries before writing. Disabling the feature removes only its marked block and preserves unrelated content. Proxy settings use VS Code machine scope and should not be synchronized between devices.
+
+## Experimental protocol conversion (text and streaming MVP)
+
+By default, services connect directly to the client protocol they implement: Anthropic Messages services are for Claude Code / Claude Desktop, and OpenAI Responses services are for Codex. If an upstream exposes only the other protocol, create an isolated local binding from **Experimental protocol conversion** on the manager home page:
+
+```text
+Anthropic Messages service → local conversion → Codex
+OpenAI Responses service → local conversion → Claude Code / Claude Desktop
+```
+
+This creates a new experimental local service; it **does not modify existing direct services, model catalogues, tokens, or active-client configuration**. It listens only on `127.0.0.1` and requires the VS Code extension host to stay running. It currently supports only plain text history, ordinary streaming, model IDs, system/instructions, and basic token usage from an already cached upstream model list.
+
+It explicitly rejects tools, images, files, thinking/reasoning, structured output, caching/context compaction, and full Claude Code / Codex Agent coding workflows. Treat it as a protocol/model connectivity probe, not a complete Agent compatibility layer. An upstream service referenced by a conversion binding cannot be deleted until that binding is removed.
 
 ## Data and security
 

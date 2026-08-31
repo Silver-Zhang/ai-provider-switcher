@@ -40,6 +40,8 @@ export type ProviderManagerAction =
   | "configureCurrentClaudeCodeModels"
   | "configureCurrentClaudeDesktopModels"
   | "openServiceLibrary"
+  | "createAdapterForCodex"
+  | "createAdapterForClaude"
   | "cancelProviderModelEdit"
   | "saveProviderModels"
   | "saveClaudeCodeModels"
@@ -69,6 +71,10 @@ export type ProviderManagerMessage = {
   providerId?: string;
   draft?: ProviderManagerDraft;
   modelForm?: ProviderModelFormPayload;
+  /** Adapter flow selects a saved opposite-protocol upstream. */
+  upstreamId?: string;
+  /** Provider name for the newly-created local binding. */
+  adapterName?: string;
   /** Provider IDs in the order the list was dragged into. */
   order?: string[];
 };
@@ -119,6 +125,8 @@ export type ProviderManagerState = {
      * will accept, so aliases are the only way to reach it from the app.
      */
     desktopAliasRequired: boolean;
+    /** Shown for explicit experimental protocol-conversion bindings only. */
+    adapterDescription?: string;
   }>;
   codexMode: string;
   codexOfficial: boolean;
@@ -134,6 +142,7 @@ export type ProviderManagerState = {
     usageEndpoint?: string;
     usageMappings?: string;
     usage: string;
+    adapterDescription?: string;
   }>;
 };
 
@@ -841,7 +850,8 @@ function overviewPane(state: ProviderManagerState): string {
     [{ label: "管理 Desktop 模型", action: "configureCurrentClaudeDesktopModels" }]
   )}</article>`;
   const libraryCard = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">▤</span><h2>服务库</h2></div><span class="badge">${state.claudeProviders.length + state.codexProviders.length} 个服务</span></div><div class="model">添加或编辑中转站的地址、Token、排序和额度。服务资料可被 Claude Code 与 Claude Desktop 共用，但不会因为查看服务库而切换任何产品。</div>${actionBar([{ label: "管理服务库", action: "openServiceLibrary", primary: true }])}</article>`;
-  const claude = `${claudeCodeCard}${desktopCard}${libraryCard}`;
+  const adapterCard = `<article class="card"><div class="card-head"><div class="card-title"><span class="provider-icon">⇄</span><h2>实验性协议转换</h2></div><span class="badge">文本 / 流式</span></div><div class="model">让 Anthropic 服务接入 Codex，或让 OpenAI Responses 服务接入 Claude。仅支持普通文本与流式输出；工具调用、图片、文件、推理和完整 Agent 编码暂不支持。</div>${actionBar([{ label: "Anthropic 服务接入 Codex", action: "createAdapterForCodex", primary: true }, { label: "Responses 服务接入 Claude", action: "createAdapterForClaude" }])}</article>`;
+  const claude = `${claudeCodeCard}${desktopCard}${libraryCard}${adapterCard}`;
   const codexModel = state.codexModel
     ? `默认模型：${state.codexModel}（可随时在 Codex 原生模型栏临时改用其它模型）`
     : "未固定默认模型，由 Codex 页面原生模型栏决定";
@@ -923,6 +933,9 @@ function providerDetail(
   const usageDetail = provider.hasUsageConfig
     ? `<div class="detail-value"><span class="usage-pill configured">已配置额度 API</span><small class="url">${escapeHtml(provider.usageEndpoint ?? "")}</small>${provider.usageMappings ? `<small class="url">字段：${escapeHtml(provider.usageMappings)}</small>` : ""}</div>`
     : `<div class="detail-value"><span class="usage-pill">未配置额度 API</span><small class="url">可从此页面直接添加和管理</small></div>`;
+  const adapterNotice = (provider as { adapterDescription?: string }).adapterDescription
+    ? `<div class="form-notice" role="note"><span>⚠</span><span>${escapeHtml((provider as { adapterDescription?: string }).adapterDescription ?? "")}；工具调用、图片、文件、推理和完整 Agent 编码会被拒绝。原有直连服务不受影响。</span></div>`
+    : "";
   if (!isClaude) {
     const inline: ActionItem[] = [
       { label: provider.active ? "重新应用此服务" : "切换到此服务", action: "switchCodex", primary: true },
@@ -932,7 +945,7 @@ function providerDetail(
     const overflow: ActionItem[] = [
       { label: "刷新模型", action: "refreshCodex" }, { label: "配置连接代理", action: "configureCodexProxy" }, { label: "打开 Codex", action: "openCodex" }, { label: "删除此服务", action: "removeProvider" }
     ];
-    return `<article class="card">${detailTop(false)}<div class="detail-heading"><span class="provider-icon">⌁</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div><div class="detail-grid"><div class="detail-item"><span class="detail-label">连接状态</span><strong>${provider.active ? "当前服务" : "可用服务"}</strong></div><div class="detail-item"><span class="detail-label">模型缓存</span><strong>${escapeHtml(String(codexProvider?.modelCount ?? 0))} 个已缓存模型</strong></div><div class="detail-item detail-wide"><span class="detail-label">额度配置</span>${usageDetail}</div></div><div class="detail-section"><div><h3>服务操作</h3><p>所有操作都针对当前选中的服务，不需要再从菜单二次选择。</p></div>${actionBar(inline, overflow, target)}</div><div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
+    return `<article class="card">${detailTop(false)}<div class="detail-heading"><span class="provider-icon">⌁</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div>${adapterNotice}<div class="detail-grid"><div class="detail-item"><span class="detail-label">连接状态</span><strong>${provider.active ? "当前服务" : "可用服务"}</strong></div><div class="detail-item"><span class="detail-label">模型缓存</span><strong>${escapeHtml(String(codexProvider?.modelCount ?? 0))} 个已缓存模型</strong></div><div class="detail-item detail-wide"><span class="detail-label">额度配置</span>${usageDetail}</div></div><div class="detail-section"><div><h3>服务操作</h3><p>所有操作都针对当前选中的服务，不需要再从菜单二次选择。</p></div>${actionBar(inline, overflow, target)}</div><div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
   }
   const desktopStatus = claudeProvider?.desktopActive
     ? `Desktop 当前正在使用此服务${claudeProvider.desktopRoutes.length ? `，已配置 ${claudeProvider.desktopRoutes.length} 个模型` : ""}。`
@@ -942,7 +955,7 @@ function providerDetail(
   const shared = `<div class="detail-section"><div><h3>共享连接信息</h3><p>名称、Base URL 与 Token 是同一个中转站的资料。若 Claude Code 或 Claude Desktop 正在使用此服务，保存后会同步正在使用的一端。</p></div>${actionBar([{ label: "编辑连接信息", action: "editProvider", primary: true }], [{ label: "删除此服务", action: "removeProvider" }], target)}</div>`;
   const code = `<div class="detail-section"><div><h3>Claude Code（VS Code / 终端）</h3><p>当前：${escapeHtml(claudeProvider?.mapping ?? "未配置")} · 命令策略：${escapeHtml(claudeProvider?.permissionStrategy ?? "未配置")}。模型角色、1M 与 effort 只写入 VS Code 内 Claude Code 和终端 CLI，不会配置 Desktop。</p></div>${actionBar([{ label: "配置 Claude Code 模型", action: "editClaudeCodeModels", primary: true }, { label: provider.active ? "重新应用 Claude Code" : "切换 Claude Code 服务", action: "switchClaude" }], [{ label: "命令策略", action: "configureClaudePermissions" }, { label: "刷新模型", action: "refreshClaude" }, { label: "检测外部配置", action: "inspectClaude" }], target)}</div>`;
   const desktop = `<div class="detail-section"><div><h3>Claude Desktop（独立应用）</h3><p>${escapeHtml(desktopStatus)} Desktop 模型目录和本地代理只影响独立桌面应用，不改变 Claude Code 或终端。</p></div>${actionBar([{ label: "配置 Desktop 模型", action: "editClaudeDesktopModels", primary: true }, { label: "切换 Desktop 服务", action: "switchClaudeDesktop" }], [], target)}</div>`;
-  return `<article class="card">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">Claude Code 使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div>${shared}${code}${desktop}<div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
+  return `<article class="card">${detailTop(true)}<div class="detail-heading"><span class="provider-icon">✦</span><div><h2>${escapeHtml(provider.name)}${provider.active ? '<span class="live-pill">Claude Code 使用中</span>' : ""}</h2><small class="url">${escapeHtml(provider.baseUrl)}</small></div></div>${adapterNotice}${shared}${code}${desktop}<div class="detail-section usage-section"><div><h3>用量与额度</h3><p>${escapeHtml(provider.usage)}</p></div>${actionBar(usageInline, usageOverflow, target)}</div></article>`;
 }
 
 const MODEL_ROLE_OPTIONS: Array<{ value: string; label: string }> = [

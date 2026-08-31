@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as https from "node:https";
 import * as http from "node:http";
 import { IncomingHttpHeaders } from "node:http";
+import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -104,6 +105,7 @@ import {
   stripClaudeProviderSettingsJson
 } from "./claudeConfig";
 import { startClaudeProxy, type ClaudeProxy } from "./claudeProxy";
+import { startLocalAdapterServer, type LocalAdapterServer, type AdapterBindingTarget } from "./localAdapterServer";
 import {
   applyClaudeDesktopEntry,
   buildClaudeDesktopGatewayConfig,
@@ -142,6 +144,14 @@ import {
   type RemoteEnvironment
 } from "./remoteEnvironment";
 
+type ProtocolAdapterBinding = {
+  id: string;
+  direction: "anthropicToResponses" | "responsesToAnthropic";
+  upstreamKind: "claudeGateway" | "codexProvider";
+  upstreamId: string;
+  textOnly: true;
+};
+
 type EnvVar = { name: string; value: string };
 type GatewayProfile = {
   id: string;
@@ -162,9 +172,18 @@ type GatewayProfile = {
    * desktop app gets opaque Claude-safe route IDs and the local proxy maps back.
    */
   desktopRoutes?: ClaudeDesktopRoute[];
+  /** Explicit opt-in local Responses → Messages protocol conversion binding. */
+  adapter?: ProtocolAdapterBinding;
 };
 type GatewayModels = { gatewayId: string; models: string[]; updatedAt: string };
-type CodexProviderProfile = { id: string; name: string; baseUrl: string; usage?: ProviderUsageConfiguration };
+type CodexProviderProfile = {
+  id: string;
+  name: string;
+  baseUrl: string;
+  usage?: ProviderUsageConfiguration;
+  /** Explicit opt-in local Messages → Responses protocol conversion binding. */
+  adapter?: ProtocolAdapterBinding;
+};
 type CodexModels = { providerId: string; models: string[]; updatedAt: string };
 
 enum ProviderMode {
@@ -183,6 +202,28 @@ const CLAUDE_ACTIVE_PROVIDER_KEY = "claudeActiveProviderId";
 const CLAUDE_DESKTOP_ROOT_KEY = "claudeDesktopConfigRoot";
 const CLAUDE_PROXY_PORT_KEY = "claudeProxyPort";
 const CLAUDE_PROXY_DEFAULT_PORT = 4180;
+const PROTOCOL_ADAPTER_PORT_KEY = "protocolAdapterPort";
+const PROTOCOL_ADAPTER_DEFAULT_PORT = 4181;
+const PROTOCOL_ADAPTER_SECRET_KEY_PREFIX = "aiProviderSwitcher.protocolAdapter.localToken.";
+
+/**
+ * Both local servers bind a fixed, user-configurable port. A stable address is
+ * essential: Desktop/Codex persist the loopback URL and cannot discover an
+ * ephemeral replacement after VS Code reloads. If the chosen port is occupied
+ * we fail the experimental binding explicitly rather than silently moving it.
+ */
+function protocolAdapterPort(): number {
+  const configured = vscode.workspace.getConfiguration("aiProviderSwitcher")
+    .get<number>(PROTOCOL_ADAPTER_PORT_KEY, PROTOCOL_ADAPTER_DEFAULT_PORT);
+  return typeof configured === "number" && configured >= 1024 && configured <= 65535
+    ? configured
+    : PROTOCOL_ADAPTER_DEFAULT_PORT;
+}
+
+function protocolAdapterBaseUrl(binding: ProtocolAdapterBinding): string {
+  const target = binding.direction === "responsesToAnthropic" ? "codex" : "claude";
+  return `http://127.0.0.1:${protocolAdapterPort()}/${target}/${binding.id}`;
+}
 const CLAUDE_USER_SETTINGS_FILE = path.join(os.homedir(), ".claude", "settings.json");
 const CODEX_SECRET_KEY_PREFIX = "aiProviderSwitcher.codex.apiKey.";
 const CODEX_PROVIDERS_KEY = "codexProviders";
@@ -316,6 +357,7 @@ export function activate(context: vscode.ExtensionContext): void {
   void (async () => {
     await refreshStatusBar();
     await startClaudeProxyForExtension(context);
+    await startProtocolAdapterForExtension(context);
   })();
 
   // Retry a deferred unified-history migration (e.g. it was skipped because the
@@ -460,7 +502,10 @@ function getProviderManagerState(): ProviderManagerState {
       desktopModels: desktopAliasRows(provider),
       desktopRoutes: desktopRouteRows(provider),
       desktopActive: claudeDesktopSnapshot.providerId === provider.id,
-      desktopAliasRequired: desktopAliasRequired(provider)
+      desktopAliasRequired: desktopAliasRequired(provider),
+      adapterDescription: provider.adapter
+        ? `实验性本地协议转换 · 仅文本 / 流式 · 上游：${provider.adapter.upstreamId}`
+        : undefined
     })),
     codexMode: getCodexModeLabel(),
     codexOfficial: !getCodexProviders().some((provider) => provider.id === activeCodexId),
@@ -475,7 +520,10 @@ function getProviderManagerState(): ProviderManagerState {
       hasUsageConfig: Boolean(provider.usage),
       usageEndpoint: provider.usage?.endpoint,
       usageMappings: formatUsageMappings(provider.usage),
-      usage: formatProviderUsageSummary(usage.get(`codex:${provider.id}`))
+      usage: formatProviderUsageSummary(usage.get(`codex:${provider.id}`)),
+      adapterDescription: provider.adapter
+        ? `实验性本地协议转换 · 仅文本 / 流式 · 上游：${provider.adapter.upstreamId}`
+        : undefined
     }))
   };
 }
@@ -883,6 +931,40 @@ async function handleProviderManagerAction(
       return;
     }
     openProviderManager(context, { kind: "claude", id: current.id, modelSurface: "desktop" });
+    return;
+  }
+  if (action === "createAdapterForCodex" || action === "createAdapterForClaude") {
+    const upstreams = action === "createAdapterForCodex" ? getGateways() : getCodexProviders();
+    if (upstreams.length === 0) {
+      vscode.window.showInformationMessage(action === "createAdapterForCodex"
+        ? "还没有 Anthropic 服务。请先在服务库添加 Claude 服务，再创建 Codex 文本协议转换。"
+        : "还没有 OpenAI Responses 服务。请先在服务库添加 Codex 服务，再创建 Claude 文本协议转换。");
+      return;
+    }
+    const selected = await vscode.window.showQuickPick(
+      upstreams.map((provider) => ({ label: provider.name, description: provider.baseUrl, provider })),
+      { title: action === "createAdapterForCodex" ? "选择要接入 Codex 的 Anthropic 上游服务" : "选择要接入 Claude 的 OpenAI Responses 上游服务", placeHolder: "只用于实验性文本/流式协议转换；不会修改原有直连服务" }
+    );
+    if (!selected) return;
+    const name = await vscode.window.showInputBox({
+      title: "命名实验性本地转换服务",
+      prompt: "该名称只显示在目标客户端的服务列表中；上游服务不会被修改。",
+      value: `${selected.provider.name}（协议转换）`,
+      validateInput: (value) => value.trim() ? undefined : "请输入名称"
+    });
+    if (!name?.trim()) return;
+    const proceed = await vscode.window.showWarningMessage(
+      `将创建“${name.trim()}”。它只支持普通文本与流式输出；工具调用、图片、文件、推理和完整 Agent 编码会被明确拒绝。原有服务不会被修改。是否继续？`,
+      { modal: true }, "创建实验性绑定", "取消"
+    );
+    if (proceed !== "创建实验性绑定") return;
+    await createProtocolAdapterBinding(
+      context,
+      action === "createAdapterForCodex" ? "responsesToAnthropic" : "anthropicToResponses",
+      action === "createAdapterForCodex" ? "claudeGateway" : "codexProvider",
+      selected.provider.id,
+      name.trim()
+    );
     return;
   }
   if (action === "saveProviderEdit") {
@@ -1656,6 +1738,8 @@ let claudeDesktopSnapshot: { label: string; official: boolean; providerId?: stri
  * the real model name straight to the relay, so they have nothing to rewrite.
  */
 let claudeProxy: ClaudeProxy | undefined;
+/** Opt-in experimental server; direct providers never depend on it. */
+let protocolAdapterServer: LocalAdapterServer | undefined;
 
 /** Where the desktop app should point when it needs the rewrite proxy. */
 function claudeProxyUrl(): string | undefined {
@@ -1726,6 +1810,93 @@ async function startClaudeProxyForExtension(context: vscode.ExtensionContext): P
     vscode.window.showWarningMessage(
       `Claude Desktop 本地改写代理启动失败：${error instanceof Error ? error.message : "未知错误"}`
     );
+  }
+}
+
+async function startProtocolAdapterForExtension(context: vscode.ExtensionContext): Promise<void> {
+  if (protocolAdapterServer) return;
+  const hasBindings = getGateways().some((gateway) => gateway.adapter) || getCodexProviders().some((provider) => provider.adapter);
+  if (!hasBindings) return;
+  try {
+    await preloadProtocolAdapterSecrets(context);
+    const port = protocolAdapterPort();
+    const server = await startLocalAdapterServer({
+      port,
+      resolve: (bindingId, target) => resolveProtocolAdapterTarget(context, bindingId, target)
+    });
+    protocolAdapterServer = server;
+    if (server.bindWarning) {
+      vscode.window.showWarningMessage(`实验性协议转换器：${server.bindWarning}请重新应用相应的绑定服务。`);
+    }
+    context.subscriptions.push({
+      dispose() {
+        server.stop();
+        if (protocolAdapterServer === server) protocolAdapterServer = undefined;
+      }
+    });
+  } catch (error) {
+    protocolAdapterServer = undefined;
+    vscode.window.showWarningMessage(`实验性协议转换器启动失败：${errorText(error)}。直接服务不受影响。`);
+  }
+}
+
+/** Resolve an explicit binding only. Never fall back to a direct/official service. */
+function resolveProtocolAdapterTarget(
+  context: vscode.ExtensionContext,
+  bindingId: string,
+  target: "claude" | "codex"
+): AdapterBindingTarget | undefined {
+  const profiles = target === "claude" ? getGateways() : getCodexProviders();
+  const profile = profiles.find((item) => item.adapter?.id === bindingId);
+  const binding = profile?.adapter;
+  if (!profile || !binding) return undefined;
+  if (target === "claude" && binding.direction !== "anthropicToResponses") return undefined;
+  if (target === "codex" && binding.direction !== "responsesToAnthropic") return undefined;
+  const upstream = binding.upstreamKind === "claudeGateway"
+    ? getGateways().find((gateway) => gateway.id === binding.upstreamId)
+    : getCodexProviders().find((provider) => provider.id === binding.upstreamId);
+  if (!upstream) return undefined;
+  const cachedToken = protocolAdapterTokens.get(binding.id);
+  if (!cachedToken) return undefined;
+  const upstreamToken = binding.upstreamKind === "claudeGateway"
+    ? gatewayTokens.get(upstream.id)
+    : codexTokens.get(upstream.id);
+  if (!upstreamToken) return undefined;
+  const models = binding.upstreamKind === "claudeGateway"
+    ? getGatewayModels().find((entry) => entry.gatewayId === upstream.id)?.models ?? []
+    : getCodexModels().find((entry) => entry.providerId === upstream.id)?.models ?? [];
+  return {
+    direction: binding.direction,
+    upstreamBaseUrl: upstream.baseUrl,
+    upstreamToken,
+    localToken: cachedToken,
+    models
+  };
+}
+
+const protocolAdapterTokens = new Map<string, string>();
+const gatewayTokens = new Map<string, string>();
+const codexTokens = new Map<string, string>();
+
+/** Preload only explicitly referenced secrets before the loopback server starts. */
+async function preloadProtocolAdapterSecrets(context: vscode.ExtensionContext): Promise<void> {
+  protocolAdapterTokens.clear();
+  gatewayTokens.clear();
+  codexTokens.clear();
+  const bindings = [
+    ...getGateways().flatMap((profile) => profile.adapter ? [profile.adapter] : []),
+    ...getCodexProviders().flatMap((profile) => profile.adapter ? [profile.adapter] : [])
+  ];
+  for (const binding of bindings) {
+    const local = await context.secrets.get(`${PROTOCOL_ADAPTER_SECRET_KEY_PREFIX}${binding.id}`);
+    if (local) protocolAdapterTokens.set(binding.id, local);
+    if (binding.upstreamKind === "claudeGateway") {
+      const token = await context.secrets.get(`${SECRET_KEY_PREFIX}${binding.upstreamId}`);
+      if (token) gatewayTokens.set(binding.upstreamId, token);
+    } else {
+      const token = await context.secrets.get(`${CODEX_SECRET_KEY_PREFIX}${binding.upstreamId}`);
+      if (token) codexTokens.set(binding.upstreamId, token);
+    }
   }
 }
 
@@ -2615,6 +2786,50 @@ function formatBackupTimestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+async function createProtocolAdapterBinding(
+  context: vscode.ExtensionContext,
+  direction: ProtocolAdapterBinding["direction"],
+  upstreamKind: ProtocolAdapterBinding["upstreamKind"],
+  upstreamId: string,
+  targetName: string
+): Promise<void> {
+  const upstream = upstreamKind === "claudeGateway"
+    ? getGateways().find((item) => item.id === upstreamId)
+    : getCodexProviders().find((item) => item.id === upstreamId);
+  if (!upstream) {
+    vscode.window.showErrorMessage("选择的上游服务已不存在，未创建协议转换绑定。");
+    return;
+  }
+  const binding: ProtocolAdapterBinding = {
+    id: randomUUID(), direction, upstreamKind, upstreamId, textOnly: true
+  };
+  const localToken = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
+  await context.secrets.store(`${PROTOCOL_ADAPTER_SECRET_KEY_PREFIX}${binding.id}`, localToken);
+  if (direction === "responsesToAnthropic") {
+    const provider: CodexProviderProfile = {
+      id: createCodexProviderId(targetName, getCodexProviders().map((item) => item.id)),
+      name: targetName,
+      baseUrl: protocolAdapterBaseUrl(binding),
+      adapter: binding
+    };
+    await vscode.workspace.getConfiguration("aiProviderSwitcher").update(CODEX_PROVIDERS_KEY, [...getCodexProviders(), provider], vscode.ConfigurationTarget.Global);
+    await saveCodexModels(provider.id, getGatewayModels().find((entry) => entry.gatewayId === upstreamId)?.models ?? []);
+    await writeCodexApiKeyFile(provider, localToken);
+  } else {
+    const provider: GatewayProfile = {
+      id: `adapter-${binding.id}`,
+      name: targetName,
+      baseUrl: protocolAdapterBaseUrl(binding),
+      adapter: binding
+    };
+    await vscode.workspace.getConfiguration("aiProviderSwitcher").update(GATEWAYS_KEY.split(".").slice(1).join("."), [...getGateways(), provider], vscode.ConfigurationTarget.Global);
+    await saveGatewayModels(provider.id, getCodexModels().find((entry) => entry.providerId === upstreamId)?.models ?? []);
+    await context.secrets.store(`${SECRET_KEY_PREFIX}${provider.id}`, localToken);
+  }
+  await startProtocolAdapterForExtension(context);
+  vscode.window.showInformationMessage(`已创建实验性文本协议转换服务“${targetName}”。它只支持文本和流式输出；工具调用、图片、文件和完整 Agent 编码暂不支持。`);
+}
+
 async function addGateway(): Promise<GatewayProfile | undefined> {
   const name = await vscode.window.showInputBox({ title: "添加中转站", prompt: "中转站名称" });
   if (!name?.trim()) return undefined;
@@ -2661,6 +2876,14 @@ async function removeGateway(
   ))?.gateway;
   if (!gateway) return;
 
+  const dependents = getCodexProviders().filter((provider) =>
+    provider.adapter?.upstreamKind === "claudeGateway" && provider.adapter.upstreamId === gateway.id
+  );
+  if (dependents.length > 0) {
+    vscode.window.showWarningMessage(`无法删除“${gateway.name}”：实验性协议转换服务 ${dependents.map((item) => `“${item.name}”`).join("、")} 正依赖它。请先删除这些转换服务。`);
+    return;
+  }
+
   const confirm = await vscode.window.showWarningMessage(
     `确定删除“${gateway.name}”？`,
     { modal: true },
@@ -2675,6 +2898,7 @@ async function removeGateway(
     vscode.ConfigurationTarget.Global
   );
   await context.secrets.delete(`${SECRET_KEY_PREFIX}${gateway.id}`);
+  if (gateway.adapter) await context.secrets.delete(`${PROTOCOL_ADAPTER_SECRET_KEY_PREFIX}${gateway.adapter.id}`);
   // Its base URL and plaintext key would otherwise stay in the desktop config
   // library, still routing Claude Desktop to a provider the user just deleted.
   await detachRemovedProviderFromClaudeDesktop(gateway.id);
@@ -3559,6 +3783,14 @@ async function removeCodexProvider(
   ))?.provider;
   if (!provider) return;
 
+  const dependents = getGateways().filter((gateway) =>
+    gateway.adapter?.upstreamKind === "codexProvider" && gateway.adapter.upstreamId === provider.id
+  );
+  if (dependents.length > 0) {
+    vscode.window.showWarningMessage(`无法删除“${provider.name}”：实验性协议转换服务 ${dependents.map((item) => `“${item.name}”`).join("、")} 正依赖它。请先删除这些转换服务。`);
+    return;
+  }
+
   const activeId = vscode.workspace
     .getConfiguration("aiProviderSwitcher")
     .get<string>(CODEX_ACTIVE_PROVIDER_KEY, "");
@@ -3581,6 +3813,7 @@ async function removeCodexProvider(
     vscode.ConfigurationTarget.Global
   );
   await context.secrets.delete(`${CODEX_SECRET_KEY_PREFIX}${provider.id}`);
+  if (provider.adapter) await context.secrets.delete(`${PROTOCOL_ADAPTER_SECRET_KEY_PREFIX}${provider.adapter.id}`);
   await deleteCodexApiKeyFile(provider);
   vscode.window.showInformationMessage(`已删除 Codex Provider：${provider.name}`);
 }
@@ -3638,6 +3871,10 @@ async function resolveCodexModels(
 ): Promise<string[] | undefined> {
   const cached = getCodexModels().find((entry) => entry.providerId === provider.id)?.models ?? [];
   if (cached.length > 0) return cached;
+  if (provider.adapter) {
+    vscode.window.showWarningMessage(`“${provider.name}”是实验性文本协议转换服务，模型来自上游服务的缓存。请先刷新或手动填写上游服务的模型列表。`);
+    return undefined;
+  }
 
   let discoveryError = "";
   try {
@@ -3823,6 +4060,22 @@ async function refreshCodexModels(context: vscode.ExtensionContext, selectedProv
   const apiKey = await getStoredCodexApiKey(context, provider);
   if (!apiKey) {
     vscode.window.showWarningMessage(`“${provider.name}”尚未保存 API Key，请先切换到该 Provider。`);
+    return;
+  }
+  if (provider.adapter) {
+    const upstream = provider.adapter.upstreamKind === "claudeGateway"
+      ? getGateways().find((item) => item.id === provider.adapter?.upstreamId)
+      : undefined;
+    const models = upstream ? (getGatewayModels().find((entry) => entry.gatewayId === upstream.id)?.models ?? []) : [];
+    if (models.length === 0) {
+      vscode.window.showWarningMessage(`“${provider.name}”的模型来自上游 Anthropic 服务缓存。请先刷新“${upstream?.name ?? "已删除的上游服务"}”的模型列表。`);
+      return;
+    }
+    await saveCodexModels(provider.id, models);
+    if (vscode.workspace.getConfiguration("aiProviderSwitcher").get<string>(CODEX_ACTIVE_PROVIDER_KEY, "") === provider.id) {
+      await writeCodexConfiguration(context, provider, models);
+    }
+    vscode.window.showInformationMessage(`已从上游“${upstream?.name}”同步 ${models.length} 个实验性文本转换模型。工具调用与 Agent 功能暂不支持。`);
     return;
   }
 
@@ -4372,6 +4625,19 @@ function getProviderUsageSnapshots(): ProviderUsageSnapshot[] {
   });
 }
 
+function normalizeProtocolAdapterBinding(value: unknown): ProtocolAdapterBinding | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const record = value as Record<string, unknown>;
+  const id = String(record.id ?? "").trim();
+  const direction = record.direction;
+  const upstreamKind = record.upstreamKind;
+  const upstreamId = String(record.upstreamId ?? "").trim();
+  if (!id || !upstreamId || record.textOnly !== true) return undefined;
+  if (direction !== "anthropicToResponses" && direction !== "responsesToAnthropic") return undefined;
+  if (upstreamKind !== "claudeGateway" && upstreamKind !== "codexProvider") return undefined;
+  return { id, direction, upstreamKind, upstreamId, textOnly: true };
+}
+
 function getCodexProviders(): CodexProviderProfile[] {
   const raw = vscode.workspace
     .getConfiguration("aiProviderSwitcher")
@@ -4383,7 +4649,8 @@ function getCodexProviders(): CodexProviderProfile[] {
       id: String(item.id ?? "").trim(),
       name: String(item.name ?? "").trim(),
       baseUrl: normalizeProviderRootUrl(String(item.baseUrl ?? "").trim()),
-      usage: normalizeUsageConfiguration(item.usage)
+      usage: normalizeUsageConfiguration(item.usage),
+      adapter: normalizeProtocolAdapterBinding(item.adapter)
     }))
     .filter((provider) => provider.id && provider.name && provider.baseUrl);
 }
@@ -4416,7 +4683,7 @@ async function writeCodexConfiguration(
   }
 
   await ensureCodexAuthHelper();
-  await writeCodexModelCatalog(models);
+  await writeCodexModelCatalog(models, provider.adapter?.textOnly === true);
   const providers = getCodexProviders();
   const unifyOn = isCodexUnifiedHistoryEnabled();
   let updated = removeManagedCodexProviders(content);
@@ -4437,11 +4704,11 @@ async function writeCodexConfiguration(
   );
 }
 
-async function writeCodexModelCatalog(models: string[]): Promise<void> {
+async function writeCodexModelCatalog(models: string[], textOnly = false): Promise<void> {
   await fs.mkdir(path.dirname(CODEX_MODEL_CATALOG_FILE), { recursive: true });
   await fs.writeFile(
     CODEX_MODEL_CATALOG_FILE,
-    `${JSON.stringify(createCodexModelCatalog(models), null, 2)}\n`,
+    `${JSON.stringify(createCodexModelCatalog(models, textOnly), null, 2)}\n`,
     "utf8"
   );
 }
@@ -5020,7 +5287,8 @@ function getGateways(): GatewayProfile[] {
         usage: normalizeUsageConfiguration(item.usage),
         desktopModels: normalizeDesktopModelNames(item.desktopModels),
         desktopModel1m: normalizeDesktopModelNames(item.desktopModel1m),
-        desktopRoutes: normalizeDesktopRoutes(item.desktopRoutes, id)
+        desktopRoutes: normalizeDesktopRoutes(item.desktopRoutes, id),
+        adapter: normalizeProtocolAdapterBinding(item.adapter)
       };
     })
     .filter((gateway) => gateway.id && gateway.name && gateway.baseUrl);

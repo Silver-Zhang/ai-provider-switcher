@@ -337,6 +337,14 @@ test("the Desktop editor is isolated from the Claude Code mapping", async () => 
   assert.doesNotMatch(detail, /data-action="autoAssignModelRoles"/);
 });
 
+test("overview labels protocol conversion as experimental and limited", () => {
+  const { detail } = open();
+  assert.match(detail, /实验性协议转换/);
+  assert.match(detail, /Anthropic 服务接入 Codex/);
+  assert.match(detail, /Responses 服务接入 Claude/);
+  assert.match(detail, /工具调用、图片、文件、推理和完整 Agent 编码暂不支持/);
+});
+
 test("overview separates Claude Code and Desktop actions", () => {
   const { detail } = open();
   assert.match(detail, /Claude Code（VS Code \/ 终端）/);
